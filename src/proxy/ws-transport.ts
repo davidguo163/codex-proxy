@@ -18,6 +18,7 @@ import type { CodexInputItem } from "./codex-api.js";
 import type { ParsedRateLimit } from "./rate-limit-headers.js";
 import { parseRateLimitsEvent } from "./rate-limit-headers.js";
 import { CodexApiError } from "./codex-types.js";
+import { getProxyUrl } from "../tls/proxy.js";
 import {
   PersistentWs,
   WsReusedConnectionError,
@@ -140,12 +141,16 @@ async function buildWsConstructorOpts(
   proxyUrl: string | null | undefined,
 ): Promise<ConstructorParameters<typeof WS>[2]> {
   const wsOpts: ConstructorParameters<typeof WS>[2] = { headers };
-  if (proxyUrl) {
-    let agent = _agentCache.get(proxyUrl);
+  // Mirror native transport proxy semantics:
+  // undefined = global default, null = explicit direct, string = specific proxy.
+  const effectiveProxyUrl =
+    proxyUrl === undefined ? getProxyUrl() : proxyUrl;
+  if (effectiveProxyUrl) {
+    let agent = _agentCache.get(effectiveProxyUrl);
     if (!agent) {
       const { HttpsProxyAgent } = await import("https-proxy-agent");
-      agent = new HttpsProxyAgent(proxyUrl);
-      _agentCache.set(proxyUrl, agent);
+      agent = new HttpsProxyAgent(effectiveProxyUrl);
+      _agentCache.set(effectiveProxyUrl, agent);
     }
     wsOpts.agent = agent;
   }
