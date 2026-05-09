@@ -35,6 +35,10 @@ function createMockCodexApi() {
 }
 
 describe("streamResponse", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("writes all chunks to the stream", async () => {
     const s = createMockStream();
     const adapter = createMockAdapter({ streamChunks: ["a", "b", "c"] });
@@ -97,5 +101,44 @@ describe("streamResponse", () => {
     // Only attempted first write which failed
     expect(s.write).toHaveBeenCalledTimes(1);
   });
-});
 
+  it("logs whether a client disconnect happened while writing the terminal event", async () => {
+    const s = createMockStream();
+    s.write
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("client gone"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const adapter = createMockAdapter({
+      streamChunks: [
+        "event: response.created\ndata: {}\n\n",
+        "event: response.completed\ndata: {}\n\n",
+      ],
+    });
+    const api = createMockCodexApi();
+    const rawResponse = new Response("ok");
+
+    await streamResponse(
+      s as never,
+      api,
+      rawResponse,
+      "gpt-5.4",
+      adapter as never,
+      vi.fn(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { requestId: "rid-terminal", tag: "Responses" },
+    );
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("[stream-client-disconnect] rid=rid-terminal tag=Responses model=gpt-5.4"),
+    );
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("last_sent_event=response.created"),
+    );
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("failed_chunk_event=response.completed failed_chunk_terminal=true"),
+    );
+  });
+});

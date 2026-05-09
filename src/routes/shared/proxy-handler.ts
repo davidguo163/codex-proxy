@@ -496,7 +496,10 @@ export async function handleProxyRequest(
         const capturedApi = codexApi;
 
         return stream(c, async (s) => {
-          s.onAbort(() => abortController.abort());
+          s.onAbort(() => {
+            console.warn(`[stream-client-abort] rid=${requestId.slice(0, 8)} tag=${fmt.tag} model=${req.model}`);
+            abortController.abort();
+          });
           const recordStreamAffinity = (): void => {
             if (!capturedResponseId) return;
             affinityMap.record(
@@ -528,6 +531,7 @@ export async function handleProxyRequest(
                 }
                 recordStreamAffinity();
               },
+              { requestId: requestId.slice(0, 8), tag: fmt.tag },
             );
           } finally {
             abortController.abort();
@@ -949,8 +953,23 @@ export async function handleDirectRequest(
     c.header("Connection", "keep-alive");
 
     return stream(c, async (s) => {
-      s.onAbort(() => abortController.abort());
-      await streamResponse(s, upstream, rawResponse, req.model, fmt, () => {}, req.tupleSchema, () => {});
+      s.onAbort(() => {
+        console.warn(`[stream-client-abort] rid=${requestId.slice(0, 8)} tag=${fmt.tag} model=${req.model}`);
+        abortController.abort();
+      });
+      await streamResponse(
+        s,
+        upstream,
+        rawResponse,
+        req.model,
+        fmt,
+        () => {},
+        req.tupleSchema,
+        () => {},
+        undefined,
+        undefined,
+        { requestId: requestId.slice(0, 8), tag: fmt.tag },
+      );
     });
   }
 

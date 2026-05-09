@@ -15,6 +15,71 @@ export interface StreamWriter {
   onAbort(cb: () => void): void;
 }
 
+export interface StreamDiagnostics {
+  requestId?: string;
+  tag?: string;
+}
+
+interface WrittenStreamTrace {
+  chunks: number;
+  bytes: number;
+  lastEvent: string | null;
+  sawTerminal: boolean;
+}
+
+interface ChunkTrace {
+  bytes: number;
+  lastEvent: string | null;
+  terminal: boolean;
+}
+
+function isTerminalStreamEvent(event: string): boolean {
+  return event === "response.completed" ||
+    event === "response.failed" ||
+    event === "error" ||
+    event === "message_stop" ||
+    event === "[DONE]";
+}
+
+function inspectStreamChunk(chunk: string): ChunkTrace {
+  const trace: ChunkTrace = {
+    bytes: Buffer.byteLength(chunk, "utf8"),
+    lastEvent: null,
+    terminal: false,
+  };
+
+  for (const line of chunk.split(/\r?\n/)) {
+    if (line.startsWith("event: ")) {
+      const event = line.slice("event: ".length).trim();
+      if (event) {
+        trace.lastEvent = event;
+        if (isTerminalStreamEvent(event)) trace.terminal = true;
+      }
+      continue;
+    }
+    if (line.startsWith("data: ")) {
+      const data = line.slice("data: ".length).trim();
+      if (data === "[DONE]") {
+        trace.lastEvent = "[DONE]";
+        trace.terminal = true;
+      }
+    }
+  }
+
+  return trace;
+}
+
+function applyWrittenChunkTrace(written: WrittenStreamTrace, chunk: ChunkTrace): void {
+  written.chunks += 1;
+  written.bytes += chunk.bytes;
+  if (chunk.lastEvent) written.lastEvent = chunk.lastEvent;
+  if (chunk.terminal) written.sawTerminal = true;
+}
+
+function formatDiagnosticValue(value: string | null | undefined): string {
+  return value && value.length > 0 ? value : "none";
+}
+
 /**
  * Stream SSE chunks from the Codex upstream to the client.
  *
@@ -32,7 +97,14 @@ export async function streamResponse(
   onResponseId?: (id: string) => void,
   usageHint?: UsageHint,
   onResponseMetadata?: (metadata: ResponseMetadata) => void,
+  diagnostics?: StreamDiagnostics,
 ): Promise<void> {
+  const written: WrittenStreamTrace = {
+    chunks: 0,
+    bytes: 0,
+    lastEvent: null,
+    sawTerminal: false,
+  };
   try {
     for await (const chunk of adapter.streamTranslator(
       api,
@@ -44,9 +116,22 @@ export async function streamResponse(
       usageHint,
       onResponseMetadata,
     )) {
+      const chunkTrace = inspectStreamChunk(chunk);
       try {
         await s.write(chunk);
-      } catch {
+        applyWrittenChunkTrace(written, chunkTrace);
+      } catch (writeErr) {
+        const errMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
+        console.warn(
+          `[stream-client-disconnect] rid=${formatDiagnosticValue(diagnostics?.requestId)}` +
+            ` tag=${formatDiagnosticValue(diagnostics?.tag ?? adapter.tag)} model=${model}` +
+            ` written_chunks=${written.chunks} written_bytes=${written.bytes}` +
+            ` last_sent_event=${formatDiagnosticValue(written.lastEvent)}` +
+            ` sent_terminal=${written.sawTerminal}` +
+            ` failed_chunk_event=${formatDiagnosticValue(chunkTrace.lastEvent)}` +
+            ` failed_chunk_terminal=${chunkTrace.terminal}` +
+            ` err=${errMsg}`,
+        );
         // Client disconnected mid-stream — stop reading upstream
         return;
       }
@@ -56,7 +141,13 @@ export async function streamResponse(
     const errStatus = err instanceof CodexApiError ? err.status : "?";
     const errBody = err instanceof CodexApiError ? err.body : undefined;
     console.warn(
-      `[stream-error] status=${errStatus} msg=${errMsg}` +
+      `[stream-error] rid=${formatDiagnosticValue(diagnostics?.requestId)}` +
+        ` tag=${formatDiagnosticValue(diagnostics?.tag ?? adapter.tag)} model=${model}` +
+        ` status=${errStatus}` +
+        ` written_chunks=${written.chunks} written_bytes=${written.bytes}` +
+        ` last_sent_event=${formatDiagnosticValue(written.lastEvent)}` +
+        ` sent_terminal=${written.sawTerminal}` +
+        ` msg=${errMsg}` +
         (errBody ? ` body=${errBody.slice(0, 1000)}` : ""),
     );
     // Send error SSE event to client before closing
