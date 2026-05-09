@@ -55,6 +55,7 @@ describe("ConfigSchema", () => {
     });
     expect(result.official_agent).toEqual({
       enabled: false,
+      api_key: null,
       app_server_url: "ws://127.0.0.1:4500",
       request_timeout_ms: 30000,
       auth: { type: "none" },
@@ -81,6 +82,7 @@ describe("ConfigSchema", () => {
       },
       official_agent: {
         enabled: true,
+        api_key: "agent-key",
         app_server_url: "ws://127.0.0.1:4777",
         request_timeout_ms: 5000,
         auth: { type: "capability_token", token_file: "/tmp/codex-token" },
@@ -107,6 +109,7 @@ describe("ConfigSchema", () => {
       disable_vision: true,
     });
     expect(result.official_agent.enabled).toBe(true);
+    expect(result.official_agent.api_key).toBe("agent-key");
     expect(result.official_agent.app_server_url).toBe("ws://127.0.0.1:4777");
     expect(result.official_agent.auth).toEqual({ type: "capability_token", token_file: "/tmp/codex-token" });
   });

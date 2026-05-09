@@ -145,6 +145,7 @@ export const ConfigSchema = z.object({
    * including the official Chrome/browser automation plugin. */
   official_agent: z.object({
     enabled: z.boolean().default(false),
+    api_key: z.string().trim().min(1).nullable().default(null),
     app_server_url: z.string().trim().refine(isWebSocketUrl, {
       message: "app_server_url must be a ws:// or wss:// URL",
     }).default("ws://127.0.0.1:4500"),
