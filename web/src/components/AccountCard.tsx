@@ -2,7 +2,7 @@ import { useCallback, useState } from "preact/hooks";
 import { useT, useI18n } from "../../../shared/i18n/context";
 import type { TranslationKey } from "../../../shared/i18n/translations";
 import { formatNumber, formatResetTime, formatWindowDuration } from "../../../shared/utils/format";
-import type { Account, ProxyEntry } from "../../../shared/types";
+import type { Account, AccountQuotaWindow, ProxyEntry } from "../../../shared/types";
 
 const avatarColors = [
   ["bg-purple-100 dark:bg-[#2a1a3f]", "text-purple-600 dark:text-purple-400"],
@@ -42,6 +42,33 @@ const statusStyles: Record<string, [string, string]> = {
     "banned",
   ],
 };
+
+type LimitBucket = NonNullable<NonNullable<Account["quota"]>["rate_limits_by_limit_id"]>[string];
+
+function normalizedLimitName(value: string | null | undefined): string {
+  return (value ?? "").trim().toLowerCase().replace(/[-\s]+/g, "_");
+}
+
+function isReviewLimitName(value: string | null | undefined): boolean {
+  const normalized = normalizedLimitName(value);
+  return normalized === "review" ||
+    normalized === "code_review" ||
+    normalized === "codex_review" ||
+    normalized === "codex_code_review" ||
+    normalized.includes("code_review") ||
+    normalized.includes("codex_review");
+}
+
+function limitLabel(bucket: LimitBucket): string {
+  const label = (bucket.limit_name || bucket.limit_id || "").trim();
+  return label ? label.replace(/_/g, " ") : "limit";
+}
+
+function limitPercent(limit: (AccountQuotaWindow & { allowed?: boolean }) | null | undefined): number | null {
+  return limit?.limit_reached ? 100
+    : limit?.used_percent != null ? Math.round(limit.used_percent)
+    : null;
+}
 
 interface AccountCardProps {
   account: Account;
@@ -122,6 +149,32 @@ export function AccountCard({ account, index, onDelete, proxies, onProxyChange, 
   const sResetAt = srl?.reset_at ? formatResetTime(srl.reset_at, lang === "zh") : null;
   const sWindowSec = srl?.limit_window_seconds;
   const sWindowDur = sWindowSec ? formatWindowDuration(sWindowSec, lang === "zh") : null;
+
+  // Quota — dedicated code review window
+  const rrl = q?.code_review_rate_limit;
+  const rPct = rrl?.limit_reached ? 100
+    : rrl?.used_percent != null ? Math.round(rrl.used_percent)
+    : null;
+  const rBarColor =
+    rPct == null ? "bg-cyan-500" : rPct >= 90 ? "bg-red-500" : rPct >= 60 ? "bg-amber-500" : "bg-cyan-500";
+  const rPctColor =
+    rPct == null
+      ? "text-cyan-500"
+      : rPct >= 90
+        ? "text-red-500"
+        : rPct >= 60
+          ? "text-amber-600 dark:text-amber-500"
+          : "text-cyan-500";
+  const rResetAt = rrl?.reset_at ? formatResetTime(rrl.reset_at, lang === "zh") : null;
+  const rWindowSec = rrl?.limit_window_seconds;
+  const rWindowDur = rWindowSec ? formatWindowDuration(rWindowSec, lang === "zh") : null;
+  const additionalRateLimits = Object.values(q?.rate_limits_by_limit_id ?? {})
+    .filter((bucket) => {
+      const limitId = normalizedLimitName(bucket.limit_id);
+      if (!limitId || limitId === "codex") return false;
+      return !isReviewLimitName(bucket.limit_id) && !isReviewLimitName(bucket.limit_name);
+    })
+    .sort((a, b) => limitLabel(a).localeCompare(limitLabel(b)));
 
   const [quotaRefreshing, setQuotaRefreshing] = useState(false);
 
@@ -335,7 +388,7 @@ export function AccountCard({ account, index, onDelete, proxies, onProxyChange, 
       )}
 
       {/* Quota bars */}
-      {(rl || srl || account.status === "active") && (
+      {(rl || srl || rrl || account.status === "active") && (
         <div class="pt-3 mt-3 border-t border-slate-100 dark:border-border-dark space-y-3">
           {/* Primary window */}
           {(rl || account.status === "active") && (
@@ -406,6 +459,123 @@ export function AccountCard({ account, index, onDelete, proxies, onProxyChange, 
               )}
             </div>
           )}
+
+          {/* Review quota window */}
+          {rrl && (
+            <div>
+              <div class="flex justify-between text-[0.78rem] mb-1.5">
+                <span class="text-slate-500 dark:text-text-dim">
+                  {t("reviewRateLimit")}
+                  {rWindowDur && (
+                    <span class="ml-1 text-slate-400 dark:text-text-dim/70 text-[0.65rem]">({rWindowDur})</span>
+                  )}
+                </span>
+                {rrl.limit_reached ? (
+                  <span class="px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/20 text-red-600 dark:text-red-400 text-xs font-medium">
+                    {t("limitReached")}
+                  </span>
+                ) : rPct != null ? (
+                  <span class={`font-medium ${rPctColor}`}>
+                    {rPct}% {t("used")}
+                  </span>
+                ) : rrl.allowed === false ? (
+                  <span class="font-medium text-slate-400 dark:text-text-dim">{t("disabled")}</span>
+                ) : (
+                  <span class="font-medium text-cyan-500">{t("ok")}</span>
+                )}
+              </div>
+              {rPct != null && (
+                <div class="w-full bg-slate-100 dark:bg-border-dark rounded-full h-2 overflow-hidden">
+                  <div class={`${rBarColor} h-2 rounded-full transition-all`} style={{ width: `${rPct}%` }} />
+                </div>
+              )}
+              {rResetAt && (
+                <p class="text-xs text-slate-400 dark:text-text-dim mt-1">
+                  {t("resetsAt")} {rResetAt}
+                </p>
+              )}
+            </div>
+          )}
+
+          {additionalRateLimits.map((bucket) => {
+            const bPct = limitPercent(bucket);
+            const bBarColor =
+              bPct == null ? "bg-sky-500" : bPct >= 90 ? "bg-red-500" : bPct >= 60 ? "bg-amber-500" : "bg-sky-500";
+            const bPctColor =
+              bPct == null
+                ? "text-sky-500"
+                : bPct >= 90
+                  ? "text-red-500"
+                  : bPct >= 60
+                    ? "text-amber-600 dark:text-amber-500"
+                    : "text-sky-500";
+            const bResetAt = bucket.reset_at ? formatResetTime(bucket.reset_at, lang === "zh") : null;
+            const bWindowDur = bucket.limit_window_seconds ? formatWindowDuration(bucket.limit_window_seconds, lang === "zh") : null;
+            const bSecondary = bucket.secondary_rate_limit;
+            const bsPct = limitPercent(bSecondary);
+            const bsResetAt = bSecondary?.reset_at ? formatResetTime(bSecondary.reset_at, lang === "zh") : null;
+            const bsWindowDur = bSecondary?.limit_window_seconds ? formatWindowDuration(bSecondary.limit_window_seconds, lang === "zh") : null;
+
+            return (
+              <div key={bucket.limit_id || bucket.limit_name}>
+                <div class="flex justify-between text-[0.78rem] mb-1.5 gap-3">
+                  <span class="text-slate-500 dark:text-text-dim truncate" title={bucket.limit_id || bucket.limit_name || undefined}>
+                    {t("additionalRateLimit")}: {limitLabel(bucket)}
+                    {bWindowDur && (
+                      <span class="ml-1 text-slate-400 dark:text-text-dim/70 text-[0.65rem]">({bWindowDur})</span>
+                    )}
+                  </span>
+                  {bucket.limit_reached ? (
+                    <span class="px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/20 text-red-600 dark:text-red-400 text-xs font-medium shrink-0">
+                      {t("limitReached")}
+                    </span>
+                  ) : bPct != null ? (
+                    <span class={`font-medium shrink-0 ${bPctColor}`}>
+                      {bPct}% {t("used")}
+                    </span>
+                  ) : bucket.allowed === false ? (
+                    <span class="font-medium text-slate-400 dark:text-text-dim shrink-0">{t("disabled")}</span>
+                  ) : (
+                    <span class="font-medium text-sky-500 shrink-0">{t("ok")}</span>
+                  )}
+                </div>
+                {bPct != null && (
+                  <div class="w-full bg-slate-100 dark:bg-border-dark rounded-full h-2 overflow-hidden">
+                    <div class={`${bBarColor} h-2 rounded-full transition-all`} style={{ width: `${Math.min(Math.max(bPct, 0), 100)}%` }} />
+                  </div>
+                )}
+                {bResetAt && (
+                  <p class="text-xs text-slate-400 dark:text-text-dim mt-1">
+                    {t("resetsAt")} {bResetAt}
+                  </p>
+                )}
+                {bSecondary && (
+                  <div class="mt-2 pl-3 border-l border-slate-200 dark:border-border-dark">
+                    <div class="flex justify-between text-[0.72rem] mb-1 gap-3">
+                      <span class="text-slate-400 dark:text-text-dim/80">
+                        {t("secondaryRateLimit")}
+                        {bsWindowDur && (
+                          <span class="ml-1 text-slate-400 dark:text-text-dim/70 text-[0.65rem]">({bsWindowDur})</span>
+                        )}
+                      </span>
+                      {bSecondary.limit_reached ? (
+                        <span class="font-medium text-red-500 shrink-0">{t("limitReached")}</span>
+                      ) : bsPct != null ? (
+                        <span class="font-medium text-sky-500 shrink-0">{bsPct}% {t("used")}</span>
+                      ) : (
+                        <span class="font-medium text-sky-500 shrink-0">{t("ok")}</span>
+                      )}
+                    </div>
+                    {bsResetAt && (
+                      <p class="text-xs text-slate-400 dark:text-text-dim mt-1">
+                        {t("resetsAt")} {bsResetAt}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>

@@ -110,7 +110,21 @@ export interface CodexQuota {
     limit_reached: boolean;
     used_percent: number | null;
     reset_at: number | null;
+    limit_window_seconds: number | null;
   } | null;
+  /** All metered quota buckets returned by Codex app's /wham/usage additional_rate_limits. */
+  rate_limits_by_limit_id?: Record<string, {
+    limit_id: string;
+    limit_name: string | null;
+    allowed: boolean;
+    limit_reached: boolean;
+    used_percent: number | null;
+    reset_at: number | null;
+    limit_window_seconds: number | null;
+    secondary_rate_limit?: CodexQuotaWindow & {
+      limit_reached: boolean;
+    } | null;
+  }> | null;
 }
 
 /** Returned by acquire() */

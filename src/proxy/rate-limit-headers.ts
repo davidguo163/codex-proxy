@@ -31,6 +31,20 @@ export interface ParsedRateLimit {
     window_minutes: number | null;
     reset_at: number | null;
   } | null;
+  code_review?: {
+    allowed?: boolean;
+    limit_reached?: boolean;
+    primary: {
+      used_percent: number;
+      window_minutes: number | null;
+      reset_at: number | null;
+    } | null;
+    secondary: {
+      used_percent: number;
+      window_minutes: number | null;
+      reset_at: number | null;
+    } | null;
+  } | null;
 }
 
 /**
@@ -45,9 +59,13 @@ export function parseRateLimitHeaders(headers: Headers | Record<string, string>)
 
   const primary = parseWindow(get, "x-codex-primary");
   const secondary = parseWindow(get, "x-codex-secondary");
+  const codeReview =
+    parseDetailsFromHeaders(get, "x-codex-code-review") ??
+    parseDetailsFromHeaders(get, "x-codex-review") ??
+    parseDetailsFromHeaders(get, "x-code-review");
 
-  if (!primary && !secondary) return null;
-  return { primary, secondary };
+  if (!primary && !secondary && !codeReview) return null;
+  return { primary, secondary, code_review: codeReview };
 }
 
 /**
@@ -78,7 +96,20 @@ export function rateLimitToQuota(
           limit_reached: secondary.used_percent >= 100,
         }
       : null,
-    code_review_rate_limit: null,
+    code_review_rate_limit: rl.code_review
+      ? {
+          allowed: rl.code_review.allowed ?? true,
+          limit_reached:
+            rl.code_review.limit_reached ??
+            (rl.code_review.primary?.used_percent ?? 0) >= 100,
+          used_percent: rl.code_review.primary?.used_percent ?? null,
+          reset_at: rl.code_review.primary?.reset_at ?? null,
+          limit_window_seconds:
+            rl.code_review.primary?.window_minutes != null
+              ? rl.code_review.primary.window_minutes * 60
+              : null,
+        }
+      : null,
   };
 }
 
@@ -107,15 +138,43 @@ interface RateLimitWindowData {
 export function parseRateLimitsEvent(data: unknown): ParsedRateLimit | null {
   if (!data || typeof data !== "object") return null;
   const obj = data as Record<string, unknown>;
-  const rl = obj.rate_limits;
-  if (!rl || typeof rl !== "object") return null;
+  const rl = parseDetailsFromObject(obj.rate_limits);
+  const explicitCodeReview =
+    parseDetailsFromObject(obj.code_review_rate_limits) ??
+    parseDetailsFromObject(obj.code_review_rate_limit);
 
-  const rlObj = rl as Record<string, unknown>;
-  const primary = parseWindowFromObject(rlObj.primary);
-  const secondary = parseWindowFromObject(rlObj.secondary);
+  let primary = rl?.primary ?? null;
+  let secondary = rl?.secondary ?? null;
+  let codeReview = explicitCodeReview;
 
+  const limitName =
+    typeof obj.metered_limit_name === "string"
+      ? obj.metered_limit_name
+      : typeof obj.limit_name === "string"
+        ? obj.limit_name
+        : null;
+  if (rl && isReviewLimitName(limitName)) {
+    codeReview = codeReview ?? rl;
+    primary = null;
+    secondary = null;
+  }
+
+  if (!primary && !secondary && !codeReview) return null;
+  return { primary, secondary, code_review: codeReview };
+}
+
+function parseDetailsFromObject(value: unknown): ParsedRateLimit["code_review"] {
+  if (!value || typeof value !== "object") return null;
+  const obj = value as Record<string, unknown>;
+  const primary = parseWindowFromObject(obj.primary);
+  const secondary = parseWindowFromObject(obj.secondary);
   if (!primary && !secondary) return null;
-  return { primary, secondary };
+  return {
+    allowed: typeof obj.allowed === "boolean" ? obj.allowed : undefined,
+    limit_reached: typeof obj.limit_reached === "boolean" ? obj.limit_reached : undefined,
+    primary,
+    secondary,
+  };
 }
 
 function parseWindowFromObject(win: unknown): RateLimitWindowData | null {
@@ -149,4 +208,23 @@ function parseWindow(
     window_minutes: winStr ? parseInt(winStr, 10) || null : null,
     reset_at: resetStr ? parseInt(resetStr, 10) || null : null,
   };
+}
+
+function parseDetailsFromHeaders(
+  get: (name: string) => string | null,
+  prefix: string,
+): NonNullable<ParsedRateLimit["code_review"]> | null {
+  const primary = parseWindow(get, `${prefix}-primary`);
+  const secondary = parseWindow(get, `${prefix}-secondary`);
+  if (!primary && !secondary) return null;
+  return { primary, secondary };
+}
+
+function isReviewLimitName(value: string | null): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase().replace(/-/g, "_");
+  return normalized === "review" ||
+    normalized === "code_review" ||
+    normalized === "codex_review" ||
+    normalized === "codex_code_review";
 }

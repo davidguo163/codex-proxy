@@ -81,6 +81,68 @@ describe("toQuota", () => {
     expect(quota.code_review_rate_limit!.allowed).toBe(true);
     expect(quota.code_review_rate_limit!.limit_reached).toBe(true);
     expect(quota.code_review_rate_limit!.used_percent).toBe(100);
+    expect(quota.code_review_rate_limit!.limit_window_seconds).toBe(3600);
+  });
+
+  it("maps WHAM additional_rate_limits into named buckets and review quota", () => {
+    const quota = toQuota(makeUsageResponse({
+      additional_rate_limits: [
+        {
+          limit_name: "Codex Other",
+          metered_feature: "codex_other",
+          rate_limit: {
+            allowed: true,
+            limit_reached: false,
+            primary_window: {
+              used_percent: 12,
+              reset_at: 1700002000,
+              limit_window_seconds: 1800,
+              reset_after_seconds: 600,
+            },
+            secondary_window: {
+              used_percent: 34,
+              reset_at: 1700100000,
+              limit_window_seconds: 604800,
+              reset_after_seconds: 9800,
+            },
+          },
+        },
+        {
+          limit_name: "Codex Code Review",
+          metered_feature: "codex_code_review",
+          rate_limit: {
+            allowed: true,
+            limit_reached: false,
+            primary_window: {
+              used_percent: 7,
+              reset_at: 1700003000,
+              limit_window_seconds: 1800,
+              reset_after_seconds: 500,
+            },
+            secondary_window: null,
+          },
+        },
+      ],
+    }));
+
+    expect(quota.rate_limits_by_limit_id?.codex_other).toMatchObject({
+      limit_id: "codex_other",
+      limit_name: "Codex Other",
+      used_percent: 12,
+      limit_window_seconds: 1800,
+      secondary_rate_limit: {
+        used_percent: 34,
+        reset_at: 1700100000,
+        limit_window_seconds: 604800,
+      },
+    });
+    expect(quota.code_review_rate_limit).toMatchObject({
+      allowed: true,
+      limit_reached: false,
+      used_percent: 7,
+      reset_at: 1700003000,
+      limit_window_seconds: 1800,
+    });
   });
 
   it("secondary limit_reached inferred from own used_percent >= 100", () => {

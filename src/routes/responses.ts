@@ -34,11 +34,36 @@ import { acquireAccount, releaseAccount } from "./shared/account-acquisition.js"
 import { handleCodexApiError } from "./shared/proxy-error-handler.js";
 import { withRetry } from "../utils/retry.js";
 import { extractCodexError } from "../types/codex-events.js";
+import {
+  extractOpenAISubagentFromMetadata,
+  normalizeOpenAISubagent,
+  OPENAI_SUBAGENT_HEADER,
+  sanitizeClientMetadata,
+} from "../proxy/openai-subagent.js";
+
+const X_CODEX_TURN_STATE_HEADER = "x-codex-turn-state";
+const X_CODEX_TURN_METADATA_HEADER = "x-codex-turn-metadata";
+const X_CODEX_BETA_FEATURES_HEADER = "x-codex-beta-features";
+const X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER = "x-responsesapi-include-timing-metrics";
+const X_CODEX_PARENT_THREAD_ID_HEADER = "x-codex-parent-thread-id";
+const X_CODEX_WINDOW_ID_HEADER = "x-codex-window-id";
 
 // ── Helpers ────────────────────────────────────────────────────────
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function firstHeaderOrMetadata(
+  c: Context,
+  metadata: Record<string, string>,
+  headerName: string,
+): string | null {
+  return nonEmptyString(c.req.header(headerName)) ?? nonEmptyString(metadata[headerName]);
 }
 
 function extractOutputTextFromItem(item: unknown): string {
@@ -602,9 +627,47 @@ export function createResponsesRoutes(
     };
 
     codexRequest.useWebSocket = true;
+    const forcedReview = c.req.path === "/v1/responses/review" || c.req.path === "/responses/review";
+    const openAiSubagent =
+      forcedReview
+        ? "review"
+        : normalizeOpenAISubagent(c.req.header(OPENAI_SUBAGENT_HEADER)) ??
+          extractOpenAISubagentFromMetadata(body.client_metadata);
+    const clientMetadata = sanitizeClientMetadata(body.client_metadata);
+    delete clientMetadata[OPENAI_SUBAGENT_HEADER];
+    if (openAiSubagent) clientMetadata[OPENAI_SUBAGENT_HEADER] = openAiSubagent;
+    if (Object.keys(clientMetadata).length > 0) {
+      codexRequest.client_metadata = clientMetadata;
+    }
     if (typeof body.previous_response_id === "string") {
       codexRequest.previous_response_id = body.previous_response_id;
     }
+    if (typeof body.prompt_cache_key === "string") {
+      codexRequest.prompt_cache_key = body.prompt_cache_key;
+    }
+    if (Array.isArray(body.include) && body.include.every((v) => typeof v === "string")) {
+      codexRequest.include = body.include as string[];
+    }
+    codexRequest.turnState =
+      nonEmptyString(body.turnState) ??
+      firstHeaderOrMetadata(c, clientMetadata, X_CODEX_TURN_STATE_HEADER) ??
+      undefined;
+    codexRequest.turnMetadata =
+      firstHeaderOrMetadata(c, clientMetadata, X_CODEX_TURN_METADATA_HEADER) ??
+      undefined;
+    codexRequest.betaFeatures =
+      firstHeaderOrMetadata(c, clientMetadata, X_CODEX_BETA_FEATURES_HEADER) ??
+      undefined;
+    codexRequest.includeTimingMetrics =
+      firstHeaderOrMetadata(c, clientMetadata, X_RESPONSESAPI_INCLUDE_TIMING_METRICS_HEADER) ??
+      undefined;
+    codexRequest.version = nonEmptyString(c.req.header("Version")) ?? undefined;
+    codexRequest.codexWindowId =
+      firstHeaderOrMetadata(c, clientMetadata, X_CODEX_WINDOW_ID_HEADER) ??
+      undefined;
+    codexRequest.parentThreadId =
+      firstHeaderOrMetadata(c, clientMetadata, X_CODEX_PARENT_THREAD_ID_HEADER) ??
+      undefined;
 
     // Reasoning effort: explicit body > suffix > config default
     const effort =
@@ -637,6 +700,9 @@ export function createResponsesRoutes(
     }
     if (body.tool_choice !== undefined) {
       codexRequest.tool_choice = body.tool_choice as CodexResponsesRequest["tool_choice"];
+    }
+    if (typeof body.parallel_tool_calls === "boolean") {
+      codexRequest.parallel_tool_calls = body.parallel_tool_calls;
     }
 
     // Detect image_generation tool at request time so we can classify the
@@ -749,6 +815,9 @@ export function createResponsesRoutes(
   };
 
   app.post("/v1/responses", responsesHandler);
+  app.post("/v1/responses/review", responsesHandler);
+  app.post("/responses", responsesHandler);
+  app.post("/responses/review", responsesHandler);
   app.post("/v1/responses/compact", compactHandler);
 
   return app;
