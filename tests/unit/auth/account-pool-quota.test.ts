@@ -156,6 +156,37 @@ describe("AccountPool quota methods", () => {
       const acct = accounts.find((a) => a.id === id);
       expect(acct?.quota).toBeUndefined();
     });
+
+    it("keeps cached quota visible after the primary reset time passes", () => {
+      const id = pool.addAccount(createValidJwt({ accountId: "a10", planType: "plus" }));
+      const nowSec = Math.floor(Date.now() / 1000);
+
+      pool.updateCachedQuota(id, makeQuota({
+        rate_limit: {
+          allowed: true,
+          limit_reached: false,
+          used_percent: 87,
+          reset_at: nowSec - 10,
+          limit_window_seconds: 3600,
+        },
+        secondary_rate_limit: {
+          limit_reached: false,
+          used_percent: 33,
+          reset_at: nowSec + 7200,
+          limit_window_seconds: 604800,
+        },
+      }));
+
+      const accounts = pool.getAccounts();
+      const acct = accounts.find((a) => a.id === id);
+
+      expect(acct?.quota).toBeDefined();
+      expect(acct?.quota?.rate_limit.used_percent).toBe(0);
+      expect(acct?.quota?.rate_limit.limit_reached).toBe(false);
+      expect(acct?.quota?.rate_limit.reset_at).toBeGreaterThan(nowSec);
+      expect(acct?.quota?.secondary_rate_limit?.used_percent).toBe(33);
+      expect(acct?.quotaFetchedAt).toBeTruthy();
+    });
   });
 
   describe("acquire skips exhausted accounts", () => {
@@ -237,11 +268,12 @@ describe("AccountPool quota methods", () => {
 
     it("allows account after cached secondary quota reset time has passed", () => {
       const id = pool.addAccount(createValidJwt({ accountId: "s1" }));
+      const nowSec = Math.floor(Date.now() / 1000);
       pool.updateCachedQuota(id, makeQuota({
         secondary_rate_limit: {
           limit_reached: true,
           used_percent: 100,
-          reset_at: Math.floor(Date.now() / 1000) - 10,
+          reset_at: nowSec - 10,
           limit_window_seconds: 3600,
         },
       }));
@@ -252,17 +284,22 @@ describe("AccountPool quota methods", () => {
       pool.release(acquired!.entryId);
 
       const entry = pool.getEntry(id);
-      expect(entry?.cachedQuota?.secondary_rate_limit).toBeNull();
+      const secondary = entry?.cachedQuota?.secondary_rate_limit;
+      expect(secondary).toBeDefined();
+      expect(secondary?.limit_reached).toBe(false);
+      expect(secondary?.used_percent).toBe(0);
+      expect(secondary?.reset_at).toBeGreaterThan(nowSec);
     });
 
     it("allows account after cached code review quota reset time has passed", () => {
       const id = pool.addAccount(createValidJwt({ accountId: "r3" }));
+      const nowSec = Math.floor(Date.now() / 1000);
       pool.updateCachedQuota(id, makeQuota({
         code_review_rate_limit: {
           allowed: false,
           limit_reached: true,
           used_percent: 100,
-          reset_at: Math.floor(Date.now() / 1000) - 10,
+          reset_at: nowSec - 10,
         },
       }));
 
@@ -272,7 +309,11 @@ describe("AccountPool quota methods", () => {
       pool.release(acquired!.entryId);
 
       const entry = pool.getEntry(id);
-      expect(entry?.cachedQuota?.code_review_rate_limit).toBeNull();
+      const codeReview = entry?.cachedQuota?.code_review_rate_limit;
+      expect(codeReview).toBeDefined();
+      expect(codeReview?.limit_reached).toBe(false);
+      expect(codeReview?.used_percent).toBe(0);
+      expect(codeReview?.reset_at).toBeNull();
     });
 
     it("allows cached exhausted accounts when skip_exhausted is false", () => {
