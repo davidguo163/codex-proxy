@@ -30,7 +30,7 @@ export function LogsPage({ embedded = false }: { embedded?: boolean }) {
     <div class={`flex flex-col gap-4 ${embedded ? "" : "p-6"}`}>
       <div class="flex items-center gap-3 flex-wrap">
         <button
-          class={`px-3 py-1.5 rounded-lg text-xs font-medium ${logs.state?.enabled ? "bg-primary/10 text-primary" : "bg-slate-200 text-slate-600"}`}
+          class={`px-3 py-1.5 rounded-lg text-xs font-medium ${logs.state?.enabled ? "bg-primary-container text-primary" : "bg-slate-200 text-slate-600"}`}
           onClick={() => logs.setLogState({ enabled: !logs.state?.enabled })}
         >
           {logs.state?.enabled ? t("logsEnabled") : t("logsDisabled")}
@@ -40,7 +40,7 @@ export function LogsPage({ embedded = false }: { embedded?: boolean }) {
             !logs.state?.enabled
               ? "bg-slate-100 text-slate-400 cursor-not-allowed"
               : logs.state?.paused
-                ? "bg-amber-100 text-amber-700"
+                ? "bg-warning-container text-warning"
                 : "bg-slate-200 text-slate-600"
           }`}
           onClick={() => logs.state?.enabled && logs.setLogState({ paused: !logs.state?.paused })}
@@ -53,7 +53,7 @@ export function LogsPage({ embedded = false }: { embedded?: boolean }) {
           {(["all", "ingress", "egress"] as const).map((dir) => (
             <button
               key={dir}
-              class={`px-2.5 py-1 rounded-md text-xs font-medium ${logs.direction === dir ? "bg-primary text-white" : "bg-slate-200 text-slate-600"}`}
+              class={`px-2.5 py-1 rounded-md text-xs font-medium ${logs.direction === dir ? "bg-primary-action text-white" : "bg-slate-200 text-slate-600"}`}
               onClick={() => logs.setDirection(dir)}
             >
               {t(`logsFilter.${dir}`)}
@@ -106,7 +106,7 @@ export function LogsPage({ embedded = false }: { embedded?: boolean }) {
                 >
                   <div class="col-span-2 text-slate-500">{row.time}</div>
                   <div class="col-span-2">
-                    <span class={`px-1.5 py-0.5 rounded ${row.direction === "ingress" ? "bg-emerald-100 text-emerald-700" : "bg-blue-100 text-blue-700"}`}>
+                    <span class={`px-1.5 py-0.5 rounded ${row.direction === "ingress" ? "bg-success-container text-success" : "bg-info-container text-info"}`}>
                       {t(`logsFilter.${row.direction}`)}
                     </span>
                   </div>
