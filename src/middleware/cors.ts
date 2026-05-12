@@ -3,13 +3,14 @@ import { isLoopbackHostname } from "../utils/host.js";
 
 /**
  * CORS middleware — allows requests from loopback origins only.
- * Handles OPTIONS preflight and sets response headers.
+ * Handles OPTIONS preflight and sets response headers for API routes only.
  */
 export const cors: MiddlewareHandler = async (c, next) => {
   const origin = c.req.header("Origin");
-  const allowedOrigin = getAllowedOrigin(origin);
+  const corsEnabled = isCorsEnabledPath(c.req.path);
+  const allowedOrigin = corsEnabled ? getAllowedOrigin(origin) : null;
 
-  if (c.req.method === "OPTIONS") {
+  if (corsEnabled && c.req.method === "OPTIONS") {
     if (!allowedOrigin) {
       return c.body(null, 403);
     }
@@ -32,6 +33,14 @@ export const cors: MiddlewareHandler = async (c, next) => {
     c.header("Vary", "Origin", { append: true });
   }
 };
+
+function isCorsEnabledPath(path: string): boolean {
+  return path.startsWith("/v1/") ||
+    path.startsWith("/v1beta/") ||
+    path === "/responses" ||
+    path.startsWith("/responses/") ||
+    path.startsWith("/official-agent/");
+}
 
 function getAllowedOrigin(origin: string | undefined): string | null {
   if (!origin) return null;
