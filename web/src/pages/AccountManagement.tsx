@@ -141,7 +141,7 @@ export function AccountManagement({ embedded }: { embedded?: boolean } = {}) {
                 onClick={() => handleStatusChipClick(key)}
                 class={`px-3 py-1 text-xs font-medium rounded-full border transition-colors ${
                   isActive
-                    ? "bg-primary text-white border-primary"
+                    ? "bg-primary-action text-white border-primary-action"
                     : "bg-white dark:bg-card-dark border-gray-200 dark:border-border-dark text-slate-600 dark:text-text-dim hover:border-primary/50"
                 }`}
               >
@@ -159,7 +159,7 @@ export function AccountManagement({ embedded }: { embedded?: boolean } = {}) {
           <div class={`mb-4 px-4 py-2 rounded-lg text-sm font-medium ${
             message.error
               ? "bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400"
-              : "bg-primary/10 text-primary"
+              : "bg-primary-container text-primary"
           }`}>
             {message.text}
           </div>
