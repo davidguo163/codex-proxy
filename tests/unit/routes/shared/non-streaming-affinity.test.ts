@@ -30,7 +30,8 @@ describe("recordNonStreamingSuccessAffinity", () => {
     expect(affinityMap.lookup("resp-ns")).toBe("entry-1");
     expect(affinityMap.lookupConversationId("resp-ns")).toBe("conversation-1");
     expect(affinityMap.lookupTurnState("resp-ns")).toBe("turn-1");
-    expect(affinityMap.lookupInstructionsHash("resp-ns")).toBeNull();
+    // null instructions → hash of empty string (sha256(""))
+    expect(affinityMap.lookupInstructionsHash("resp-ns")).toBe("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     expect(affinityMap.lookupInputTokens("resp-ns")).toBe(0);
     expect(affinityMap.lookupFunctionCallIds("resp-ns")).toEqual(["call-a", "call-b"]);
     expect(affinityMap.lookupLatestResponseIdByConversationId(

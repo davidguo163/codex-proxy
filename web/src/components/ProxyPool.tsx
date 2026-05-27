@@ -48,6 +48,7 @@ export function ProxyPool({ proxies }: ProxyPoolProps) {
   const resetForm = useCallback(() => {
     setNewName("");
     setNewRawUrl("");
+    setUrlMode(false);
     setNewProtocol("http");
     setNewHost("");
     setNewPort("");
@@ -87,7 +88,7 @@ export function ProxyPool({ proxies }: ProxyPoolProps) {
       resetForm();
       setShowAdd(false);
     }
-  }, [newName, newProtocol, newHost, newPort, newUsername, newPassword, proxies, resetForm, t]);
+  }, [newName, newRawUrl, urlMode, newProtocol, newHost, newPort, newUsername, newPassword, proxies, resetForm, t]);
 
   const handleCheck = useCallback(
     async (id: string) => {

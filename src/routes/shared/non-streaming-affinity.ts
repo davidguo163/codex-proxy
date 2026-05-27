@@ -34,7 +34,7 @@ export function recordNonStreamingSuccessAffinity(
     entryId,
     conversationId,
     turnState,
-    instructions ?? undefined,
+    instructions,
     inputTokens,
     Array.from(new Set(responseFunctionCallIds)),
     variantHash,

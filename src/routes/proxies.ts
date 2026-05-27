@@ -75,7 +75,7 @@ export function createProxyRoutes(proxyPool: ProxyPool, accountPool: AccountPool
       return c.json({ error: "Invalid proxy URL format" });
     }
 
-    const name = body.name?.trim() || url;
+    const name = body.name?.trim() || stripCredentials(url);
     const id = proxyPool.add(name, url);
     const proxy = proxyPool.getById(id);
 
@@ -423,6 +423,18 @@ export function createProxyRoutes(proxyPool: ProxyPool, accountPool: AccountPool
   });
 
   return app;
+}
+
+/** Return URL with username/password removed — safe to use as a display name. */
+function stripCredentials(url: string): string {
+  try {
+    const u = new URL(url);
+    u.username = "";
+    u.password = "";
+    return u.toString();
+  } catch {
+    return url;
+  }
 }
 
 /** Compose a proxy URL from separate fields. */

@@ -45,7 +45,7 @@ export class SessionAffinityMap {
     entryId: string,
     conversationId: string,
     turnState?: string,
-    instructions?: string,
+    instructions?: string | null,
     inputTokens?: number,
     functionCallIds?: string[],
     variantHash?: string,
@@ -55,7 +55,7 @@ export class SessionAffinityMap {
       conversationId,
       turnState,
       instructionsHash: instructions !== undefined
-        ? createHash("sha256").update(instructions).digest("hex")
+        ? createHash("sha256").update(instructions ?? "").digest("hex")
         : undefined,
       inputTokens,
       functionCallIds: functionCallIds ? [...functionCallIds] : undefined,
