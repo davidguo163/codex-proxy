@@ -29,7 +29,9 @@ interface ProxyPoolProps {
 export function ProxyPool({ proxies }: ProxyPoolProps) {
   const t = useT();
   const [showAdd, setShowAdd] = useState(false);
+  const [urlMode, setUrlMode] = useState(false);
   const [newName, setNewName] = useState("");
+  const [newRawUrl, setNewRawUrl] = useState("");
   const [newProtocol, setNewProtocol] = useState("http");
   const [newHost, setNewHost] = useState("");
   const [newPort, setNewPort] = useState("");
@@ -45,6 +47,8 @@ export function ProxyPool({ proxies }: ProxyPoolProps) {
 
   const resetForm = useCallback(() => {
     setNewName("");
+    setNewRawUrl("");
+    setUrlMode(false);
     setNewProtocol("http");
     setNewHost("");
     setNewPort("");
@@ -55,6 +59,17 @@ export function ProxyPool({ proxies }: ProxyPoolProps) {
 
   const handleAdd = useCallback(async () => {
     setAddError("");
+    if (urlMode) {
+      if (!newRawUrl.trim()) {
+        setAddError(t("proxyUrl") + " is required");
+        return;
+      }
+      const err = await proxies.addProxy({ name: newName, url: newRawUrl.trim(), protocol: "", host: "", port: "", username: "", password: "" });
+      if (err) { setAddError(err); return; }
+      resetForm();
+      setShowAdd(false);
+      return;
+    }
     if (!newHost.trim()) {
       setAddError(t("proxyHost") + " is required");
       return;
@@ -73,7 +88,7 @@ export function ProxyPool({ proxies }: ProxyPoolProps) {
       resetForm();
       setShowAdd(false);
     }
-  }, [newName, newProtocol, newHost, newPort, newUsername, newPassword, proxies, resetForm, t]);
+  }, [newName, newRawUrl, urlMode, newProtocol, newHost, newPort, newUsername, newPassword, proxies, resetForm, t]);
 
   const handleCheck = useCallback(
     async (id: string) => {
@@ -229,6 +244,41 @@ export function ProxyPool({ proxies }: ProxyPoolProps) {
       {/* Add form */}
       {showAdd && (
         <div class="bg-white dark:bg-card-dark border border-gray-200 dark:border-border-dark rounded-xl p-4 mb-4">
+          {/* Mode toggle */}
+          <div class="flex items-center gap-2 mb-3">
+            <button
+              onClick={() => { setUrlMode(false); setAddError(""); }}
+              class={`px-3 py-1 text-xs font-medium rounded-lg border transition-colors ${!urlMode ? "bg-primary-action text-white border-primary-action" : "border-gray-200 dark:border-border-dark hover:bg-slate-50 dark:hover:bg-border-dark"}`}
+            >
+              {t("proxyFieldsMode")}
+            </button>
+            <button
+              onClick={() => { setUrlMode(true); setAddError(""); }}
+              class={`px-3 py-1 text-xs font-medium rounded-lg border transition-colors ${urlMode ? "bg-primary-action text-white border-primary-action" : "border-gray-200 dark:border-border-dark hover:bg-slate-50 dark:hover:bg-border-dark"}`}
+            >
+              {t("proxyUrlMode")}
+            </button>
+          </div>
+
+          {urlMode ? (
+            <div class="space-y-2">
+              <input
+                type="text"
+                placeholder={`${t("proxyName")} (${t("proxyOptional")})`}
+                value={newName}
+                onInput={(e) => setNewName((e.target as HTMLInputElement).value)}
+                class={inputCls + " w-full"}
+              />
+              <input
+                type="text"
+                placeholder="http://user:pass@host:port"
+                value={newRawUrl}
+                onInput={(e) => setNewRawUrl((e.target as HTMLInputElement).value)}
+                class={inputCls + " w-full font-mono"}
+              />
+            </div>
+          ) : (
+          <>
           <div class="grid grid-cols-[auto_1fr_auto] sm:grid-cols-[auto_1fr_80px] gap-2 items-center">
             {/* Row 1: Protocol + Host + Port */}
             <select
@@ -279,6 +329,8 @@ export function ProxyPool({ proxies }: ProxyPoolProps) {
               class={`${inputCls} col-span-2 sm:col-span-1`}
             />
           </div>
+          </>
+          )}
           <div class="flex items-center justify-between mt-3">
             {addError && (
               <p class="text-xs text-red-500">{addError}</p>

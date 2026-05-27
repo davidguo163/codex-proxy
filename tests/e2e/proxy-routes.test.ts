@@ -205,6 +205,40 @@ describe("POST /api/proxies", () => {
     const body = await res.json() as { error: string };
     expect(body.error).toContain("Invalid proxy URL");
   });
+
+  it("strips credentials from URL when name is empty (URL paste mode)", async () => {
+    const res = await app.request("/api/proxies", json({
+      url: "http://user:secret@proxy.example.com:8080",
+    }));
+    expect(res.status).toBe(200);
+    const body = await res.json() as { success: boolean; proxy: { name: string; url: string } };
+    expect(body.success).toBe(true);
+    expect(body.proxy.name).not.toContain("user");
+    expect(body.proxy.name).not.toContain("secret");
+    expect(body.proxy.name).toContain("proxy.example.com");
+  });
+
+  it("accepts full URL in host field (paste into host input)", async () => {
+    const res = await app.request("/api/proxies", json({
+      name: "Pasted",
+      host: "http://proxy.example.com:9090",
+    }));
+    expect(res.status).toBe(200);
+    const body = await res.json() as { success: boolean; proxy: { name: string; url: string } };
+    expect(body.success).toBe(true);
+    expect(body.proxy.name).toBe("Pasted");
+    expect(body.proxy.url).toBe("http://proxy.example.com:9090");
+  });
+
+  it("uses explicit name over URL when both provided", async () => {
+    const res = await app.request("/api/proxies", json({
+      name: "My Proxy",
+      url: "http://user:pass@proxy.example.com:8080",
+    }));
+    expect(res.status).toBe(200);
+    const body = await res.json() as { success: boolean; proxy: { name: string } };
+    expect(body.proxy.name).toBe("My Proxy");
+  });
 });
 
 describe("PUT /api/proxies/:id", () => {

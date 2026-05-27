@@ -47,7 +47,14 @@ export function createProxyRoutes(proxyPool: ProxyPool, accountPool: AccountPool
 
     // Compose URL from separate fields if raw url not provided
     if (!url && body.host) {
-      url = composeProxyUrl(body.protocol, body.host, body.port, body.username, body.password);
+      const trimmedHost = body.host.trim();
+      // If the host field already contains a full URL, use it directly to avoid
+      // double-prefixing (e.g. user pastes http://user:pass@host:port into host field)
+      if (/^https?:\/\/|^socks5h?:\/\//i.test(trimmedHost)) {
+        url = trimmedHost;
+      } else {
+        url = composeProxyUrl(body.protocol, trimmedHost, body.port, body.username, body.password);
+      }
     }
 
     if (!url) {
@@ -68,7 +75,7 @@ export function createProxyRoutes(proxyPool: ProxyPool, accountPool: AccountPool
       return c.json({ error: "Invalid proxy URL format" });
     }
 
-    const name = body.name?.trim() || url;
+    const name = body.name?.trim() || stripCredentials(url);
     const id = proxyPool.add(name, url);
     const proxy = proxyPool.getById(id);
 
@@ -416,6 +423,18 @@ export function createProxyRoutes(proxyPool: ProxyPool, accountPool: AccountPool
   });
 
   return app;
+}
+
+/** Return URL with username/password removed — safe to use as a display name. */
+function stripCredentials(url: string): string {
+  try {
+    const u = new URL(url);
+    u.username = "";
+    u.password = "";
+    return u.toString();
+  } catch {
+    return url;
+  }
 }
 
 /** Compose a proxy URL from separate fields. */

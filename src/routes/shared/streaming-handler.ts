@@ -82,7 +82,7 @@ export function handleStreaming(options: HandleStreamingOptions): Response {
         capturedEntryId,
         conversationId,
         turnState,
-        req.codexRequest.instructions ?? undefined,
+        req.codexRequest.instructions,
         usageInfo?.input_tokens,
         Array.from(metadataCollector.responseFunctionCallIds),
         variantHash,
