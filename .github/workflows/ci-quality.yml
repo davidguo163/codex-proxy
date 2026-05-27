@@ -30,3 +30,26 @@ jobs:
 
       - name: Type-check public update scripts
         run: npm run typecheck:scripts
+
+  test-build-typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run full test suite
+        run: npm test
+
+      - name: Type-check source
+        run: npx tsc --noEmit
+
+      - name: Build web frontend
+        run: npm run build:web
