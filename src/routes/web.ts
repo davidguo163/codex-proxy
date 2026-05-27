@@ -12,9 +12,11 @@ import { createOllamaAdminRoutes } from "./admin/ollama.js";
 import { createUsageStatsRoutes } from "./admin/usage-stats.js";
 import { createLogRoutes } from "./admin/logs.js";
 import { createErrorLogRoutes } from "./admin/error-logs.js";
+import { createKeepaliveRoutes } from "./admin/keepalive.js";
 import type { UsageStatsStore } from "../auth/usage-stats.js";
+import type { KeepaliveScheduler } from "../auth/keepalive-scheduler.js";
 
-export function createWebRoutes(accountPool: AccountPool, usageStats: UsageStatsStore): Hono {
+export function createWebRoutes(accountPool: AccountPool, usageStats: UsageStatsStore, keepaliveScheduler?: KeepaliveScheduler): Hono {
   const app = new Hono();
 
   const publicDir = getPublicDir();
@@ -51,6 +53,9 @@ export function createWebRoutes(accountPool: AccountPool, usageStats: UsageStats
   app.route("/", createUsageStatsRoutes(accountPool, usageStats));
   app.route("/", createLogRoutes());
   app.route("/", createErrorLogRoutes());
+  if (keepaliveScheduler) {
+    app.route("/", createKeepaliveRoutes(keepaliveScheduler));
+  }
 
   return app;
 }

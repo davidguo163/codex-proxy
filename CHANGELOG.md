@@ -24,6 +24,7 @@
 
 ### Added (continued)
 
+- 账号保活调度器（`account_keepalive`）：新增可选定时 keepalive 功能，默认关闭；支持 `fixed_times`（每天固定 HH:mm，默认 07:00/13:00/18:00）和 `interval`（每 N 分钟）两种模式；并发可配（默认 2），批次间可节流（`per_account_delay_ms`）；对每个活跃账号调用 `/codex/usage` 刷新额度窗口状态并更新 `cachedQuota`，失活/封禁账号自动标为 `expired`；新增 `GET /admin/keepalive-status`、`POST /admin/keepalive-config`、`POST /admin/keepalive-run` 三个 Admin 端点；14 个单元测试覆盖 `computeNextRun`（跨天、多时间点、interval 模式）+ `runNow`（账号过滤、单账号失败隔离、并发保护、状态更新）（`src/auth/keepalive-scheduler.ts`、`src/routes/admin/keepalive.ts`、`src/config-schema.ts`、`tests/unit/auth/keepalive-scheduler.test.ts`）（closes #512 partial — Dashboard UI 待后续）
 - 新增 E2E 测试覆盖账号 CRUD、管理员设置、Dashboard 登录三条关键 HTTP 路径（47 个新用例）：`tests/e2e/accounts.test.ts`（list / add / delete / reset-usage / label / cookies / batch-delete / batch-status / export / quota-warnings）、`tests/e2e/admin-settings.test.ts`（rotation / settings / general / quota 四组 GET+POST）、`tests/e2e/dashboard-login.test.ts`（login / logout / status + 速率限制）（closes #376 partial）
 
 ### Changed
