@@ -6,7 +6,7 @@ import { isLoopbackHostname, normalizeHostname } from "../utils/host.js";
  * CORS middleware — allows requests from loopback origins and configured hosts.
  * Handles OPTIONS preflight and sets response headers for API routes only.
  */
-export const cors: MiddlewareHandler = async (c: any, next: any) => {
+export const cors: MiddlewareHandler = async (c, next) => {
   const origin = c.req.header("Origin");
   const corsEnabled = isCorsEnabledPath(c.req.path);
   const allowedOrigin = corsEnabled ? getAllowedOrigin(origin) : null;
