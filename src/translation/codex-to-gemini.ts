@@ -16,7 +16,7 @@ import type {
   GeminiPart,
 } from "../types/gemini.js";
 import { iterateCodexEvents, EmptyResponseError, type UsageInfo } from "./codex-event-extractor.js";
-import { reconvertTupleValues } from "./tuple-schema.js";
+import { TupleStreamDecoder, reconvertTupleValues } from "./tuple-schema.js";
 import { codexApiErrorFromEvent } from "./codex-api-error-from-event.js";
 
 /**
@@ -36,7 +36,7 @@ export async function* streamCodexToGemini(
   let outputTokens = 0;
   let cachedTokens: number | undefined;
   let hasContent = false;
-  let tupleTextBuffer = tupleSchema ? "" : null;
+  const tupleDecoder = tupleSchema ? new TupleStreamDecoder(tupleSchema) : null;
 
   for await (const evt of iterateCodexEvents(codexApi, rawResponse)) {
     if (evt.responseId) onResponseId?.(evt.responseId);
@@ -78,14 +78,13 @@ export async function* streamCodexToGemini(
       case "response.output_text.delta": {
         if (evt.textDelta) {
           hasContent = true;
-          if (tupleTextBuffer !== null) {
-            tupleTextBuffer += evt.textDelta;
-          } else {
+          const text = tupleDecoder ? tupleDecoder.push(evt.textDelta) : evt.textDelta;
+          if (text) {
             const chunk: GeminiGenerateContentResponse = {
               candidates: [
                 {
                   content: {
-                    parts: [{ text: evt.textDelta }],
+                    parts: [{ text }],
                     role: "model",
                   },
                   index: 0,
@@ -100,27 +99,6 @@ export async function* streamCodexToGemini(
       }
 
       case "response.completed": {
-        // Flush buffered tuple text as reconverted JSON
-        if (tupleTextBuffer !== null && tupleSchema && tupleTextBuffer) {
-          let text = tupleTextBuffer;
-          try {
-            const parsed = JSON.parse(tupleTextBuffer) as unknown;
-            text = JSON.stringify(reconvertTupleValues(parsed, tupleSchema));
-          } catch (e) { console.warn("[tuple-reconvert] streaming JSON parse failed, emitting raw text:", e); }
-          const tupleChunk: GeminiGenerateContentResponse = {
-            candidates: [
-              {
-                content: {
-                  parts: [{ text }],
-                  role: "model",
-                },
-                index: 0,
-              },
-            ],
-            modelVersion: model,
-          };
-          yield `data: ${JSON.stringify(tupleChunk)}\n\n`;
-        }
         if (evt.usage) {
           inputTokens = evt.usage.input_tokens;
           outputTokens = evt.usage.output_tokens;

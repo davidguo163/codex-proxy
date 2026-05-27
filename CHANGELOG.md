@@ -24,6 +24,7 @@
 
 ### Fixed
 
+- Tuple schema streaming 不再全量缓冲：新增 `TupleStreamDecoder` 逐字符追踪 JSON 深度，每个顶层数组元素边界完成时立即 emit，彻底消除 structured output 使用 `prefixItems` 时响应看起来"卡住"的问题；同时修复 Gemini streaming 路径相同缺陷（`src/translation/tuple-schema.ts`、`src/translation/codex-to-openai.ts`、`src/translation/codex-to-gemini.ts`）（closes #379）
 - `/v1/chat/completions` 和 `/v1/messages` 路由在 `wantReasoning`/`wantThinking` 判断时现在读取翻译后的 `codexRequest.reasoning?.effort`，而非原始请求字段：此前仅当客户端显式传 `reasoning_effort` / `thinking.type` 时才向客户端透传推理摘要，通过 model suffix（如 `gpt-5.4-high`）或 `default_reasoning_effort` 配置注入的 effort 虽然正确发到上游，但 Codex 返回的 `response.reasoning_summary_text.delta` 被代理静默丢弃，导致客户端看不到任何推理内容、误以为 effort 无效（`src/routes/chat.ts`、`src/routes/messages.ts`、`tests/unit/translation/openai-to-codex.test.ts`）
 - 代理 host 字段粘贴完整 URL 时不再 double-prefix：`POST /api/proxies` body 的 `host` 如果是形如 `http://...` 或 `socks5://...` 的完整 URL，后端直接使用而不再拼接 protocol + port，避免生成 `http://http://...` 的畸形 URL；name 为空时自动回退到 URL 前，先去掉 username/password 防止凭证写入代理名称（`src/routes/proxies.ts`）
 - `SessionAffinityMap` 现在存储 instructions 的 SHA-256 hex hash 而非原始字符串，防止长 system prompt 请求在 affinity 记录里大量占用内存；implicit-resume 的 instructions 比对改为 hash 对比（`src/auth/session-affinity.ts`、`src/routes/shared/proxy-session-helpers.ts`、`src/routes/shared/proxy-session-context.ts`）；修复 null instructions（无 system prompt 的请求）通过 `?? undefined` 被转为 `undefined` 导致 hash 不落盘、下一轮 implicit-resume 比对必然失败的回归（`src/auth/session-affinity.ts`、`src/routes/shared/non-streaming-affinity.ts`、`src/routes/shared/streaming-handler.ts`）

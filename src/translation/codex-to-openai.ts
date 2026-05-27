@@ -24,7 +24,7 @@ import {
   UpstreamPrematureCloseError,
   type UsageInfo,
 } from "./codex-event-extractor.js";
-import { reconvertTupleValues } from "./tuple-schema.js";
+import { TupleStreamDecoder, reconvertTupleValues } from "./tuple-schema.js";
 import { codexApiErrorFromEvent } from "./codex-api-error-from-event.js";
 import { debugDump, debugDumpEnabled } from "../utils/debug-dump.js";
 
@@ -52,8 +52,7 @@ export async function* streamCodexToOpenAI(
   const created = Math.floor(Date.now() / 1000);
   let hasToolCalls = false;
   let hasContent = false;
-  // When tupleSchema is set, buffer text deltas to reconvert at response.completed
-  let tupleTextBuffer = tupleSchema ? "" : null;
+  const tupleDecoder = tupleSchema ? new TupleStreamDecoder(tupleSchema) : null;
   // Track tool call indices by call_id
   const toolCallIndexMap = new Map<string, number>();
   let nextToolCallIndex = 0;
@@ -188,10 +187,8 @@ export async function* streamCodexToOpenAI(
       case "response.output_text.delta": {
         if (evt.textDelta) {
           hasContent = true;
-          if (tupleTextBuffer !== null) {
-            // Buffer text for reconversion
-            tupleTextBuffer += evt.textDelta;
-          } else {
+          const text = tupleDecoder ? tupleDecoder.push(evt.textDelta) : evt.textDelta;
+          if (text) {
             yield formatSSE({
               id: chunkId,
               object: "chat.completion.chunk",
@@ -200,7 +197,7 @@ export async function* streamCodexToOpenAI(
               choices: [
                 {
                   index: 0,
-                  delta: { content: evt.textDelta },
+                  delta: { content: text },
                   finish_reason: null,
                 },
               ],
@@ -211,42 +208,6 @@ export async function* streamCodexToOpenAI(
       }
 
       case "response.completed": {
-        // Flush buffered tuple text as reconverted JSON
-        if (tupleTextBuffer !== null && tupleSchema && tupleTextBuffer) {
-          try {
-            const parsed = JSON.parse(tupleTextBuffer) as unknown;
-            const reconverted = reconvertTupleValues(parsed, tupleSchema);
-            yield formatSSE({
-              id: chunkId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [
-                {
-                  index: 0,
-                  delta: { content: JSON.stringify(reconverted) },
-                  finish_reason: null,
-                },
-              ],
-            });
-          } catch (e) {
-            console.warn("[tuple-reconvert] streaming JSON parse failed, emitting raw text:", e);
-            yield formatSSE({
-              id: chunkId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [
-                {
-                  index: 0,
-                  delta: { content: tupleTextBuffer },
-                  finish_reason: null,
-                },
-              ],
-            });
-          }
-        }
-
         if (evt.usage) onUsage?.(evt.usage);
         onResponseCompleted?.(evt.responseId);
         // Inject error text if stream completed with no content

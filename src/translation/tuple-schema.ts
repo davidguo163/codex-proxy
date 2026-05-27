@@ -205,3 +205,175 @@ function resolveRef(ref: string, root: Schema): Schema | undefined {
   const resolved = defs[match[2]];
   return isRecord(resolved) ? resolved : undefined;
 }
+
+// ── Incremental streaming decoder ─────────────────────────────────
+
+type DecoderState = "await-open" | "skip-key" | "collect-value" | "done";
+
+/**
+ * Incrementally decodes a Codex-streamed tuple object {"0":v0,"1":v1,...}
+ * back into a JSON array [v0,v1,...], emitting each element as soon as its
+ * JSON boundary is detected rather than buffering the entire response.
+ *
+ * Feed text deltas via push(); call flush() at stream end to close any
+ * unclosed bracket on a truncated stream.
+ */
+export class TupleStreamDecoder {
+  private state: DecoderState = "await-open";
+  private valueBuf = "";
+  private valueDepth = 0;
+  private inStr = false;
+  private escaped = false;
+  private keyBuf = "";
+  private currentKey = "";
+
+  constructor(
+    private readonly schema: Schema,
+    private readonly rootSchema: Schema = schema,
+  ) {}
+
+  push(delta: string): string {
+    let out = "";
+    for (let i = 0; i < delta.length; i++) {
+      out += this.step(delta[i]);
+    }
+    return out;
+  }
+
+  /** Safety-net closer for truncated streams. */
+  flush(): string {
+    return this.state === "done" ? "" : "]";
+  }
+
+  private step(ch: string): string {
+    switch (this.state) {
+      case "await-open":
+        if (ch === "{") {
+          this.state = "skip-key";
+          return "[";
+        }
+        return "";
+
+      case "skip-key":
+        return this.stepKey(ch);
+
+      case "collect-value":
+        return this.stepValue(ch);
+
+      case "done":
+        return "";
+    }
+  }
+
+  private stepKey(ch: string): string {
+    if (this.escaped) {
+      this.escaped = false;
+      if (this.inStr) this.keyBuf += ch;
+      return "";
+    }
+    if (ch === "\\") {
+      if (this.inStr) {
+        this.escaped = true;
+        this.keyBuf += ch;
+      }
+      return "";
+    }
+    if (ch === '"') {
+      if (!this.inStr) {
+        this.inStr = true;
+        this.keyBuf = "";
+      } else {
+        this.inStr = false;
+        this.currentKey = this.keyBuf;
+      }
+      return "";
+    }
+    if (this.inStr) {
+      this.keyBuf += ch;
+      return "";
+    }
+    if (ch === ":") {
+      this.state = "collect-value";
+      this.valueBuf = "";
+      this.valueDepth = 0;
+      this.inStr = false;
+      this.escaped = false;
+    }
+    // whitespace and other chars between key and colon — skip
+    return "";
+  }
+
+  private stepValue(ch: string): string {
+    if (this.escaped) {
+      this.escaped = false;
+      this.valueBuf += ch;
+      return "";
+    }
+    if (ch === "\\") {
+      if (this.inStr) {
+        this.escaped = true;
+        this.valueBuf += ch;
+      } else {
+        // bare backslash outside string — pass through
+        this.valueBuf += ch;
+      }
+      return "";
+    }
+    if (ch === '"') {
+      this.inStr = !this.inStr;
+      this.valueBuf += ch;
+      return "";
+    }
+    if (!this.inStr) {
+      if (ch === "{" || ch === "[") {
+        this.valueDepth++;
+        this.valueBuf += ch;
+        return "";
+      }
+      if (ch === "}" || ch === "]") {
+        if (this.valueDepth > 0) {
+          this.valueDepth--;
+          this.valueBuf += ch;
+          return "";
+        }
+        // Outer object closed — last value complete
+        const emitted = this.emitValue();
+        this.state = "done";
+        return emitted + "]";
+      }
+      if (ch === "," && this.valueDepth === 0) {
+        const emitted = this.emitValue();
+        this.state = "skip-key";
+        this.inStr = false;
+        this.escaped = false;
+        return emitted + ",";
+      }
+    }
+    // Skip leading whitespace before value content starts
+    if (this.valueBuf.length === 0 && (ch === " " || ch === "\t" || ch === "\n" || ch === "\r")) {
+      return "";
+    }
+    this.valueBuf += ch;
+    return "";
+  }
+
+  private emitValue(): string {
+    const raw = this.valueBuf.trimEnd();
+    this.valueBuf = "";
+    if (!raw) return "null";
+
+    const keyIndex = parseInt(this.currentKey, 10);
+    const prefixItems = this.schema.prefixItems as unknown[] | undefined;
+    const itemSchema = Number.isFinite(keyIndex) ? prefixItems?.[keyIndex] : undefined;
+
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      const reconverted = isRecord(itemSchema)
+        ? reconvertTupleValues(parsed, itemSchema, this.rootSchema)
+        : parsed;
+      return JSON.stringify(reconverted);
+    } catch {
+      return raw;
+    }
+  }
+}

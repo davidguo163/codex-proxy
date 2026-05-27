@@ -3,6 +3,7 @@ import {
   convertTupleSchemas,
   reconvertTupleValues,
   hasTupleSchemas,
+  TupleStreamDecoder,
 } from "@src/translation/tuple-schema.js";
 
 describe("hasTupleSchemas", () => {
@@ -374,5 +375,105 @@ describe("reconvertTupleValues", () => {
     const data = { coord: { "0": 40.7, "1": -74.0 } };
     const result = reconvertTupleValues(data, originalSchema) as Record<string, unknown>;
     expect(result.coord).toEqual([40.7, -74.0]);
+  });
+});
+
+describe("TupleStreamDecoder", () => {
+  const flatSchema = {
+    type: "array",
+    prefixItems: [{ type: "string" }, { type: "number" }, { type: "boolean" }],
+  };
+
+  function decode(schema: Record<string, unknown>, input: string, chunkSize = 1): string {
+    const dec = new TupleStreamDecoder(schema);
+    let out = "";
+    for (let i = 0; i < input.length; i += chunkSize) {
+      out += dec.push(input.slice(i, i + chunkSize));
+    }
+    return out;
+  }
+
+  it("decodes a flat tuple in one push", () => {
+    const input = '{"0":"hello","1":42,"2":true}';
+    expect(decode(flatSchema, input, input.length)).toBe('["hello",42,true]');
+  });
+
+  it("decodes the same tuple character-by-character", () => {
+    const input = '{"0":"hello","1":42,"2":true}';
+    expect(decode(flatSchema, input, 1)).toBe('["hello",42,true]');
+  });
+
+  it("emits values progressively — output grows before stream ends", () => {
+    const schema = { type: "array", prefixItems: [{ type: "string" }, { type: "string" }] };
+    const dec = new TupleStreamDecoder(schema);
+    const firstHalf = '{"0":"alpha","1":';
+    let out = dec.push(firstHalf);
+    // First element should have been emitted already
+    expect(out).toContain('"alpha"');
+    out += dec.push('"beta"}');
+    expect(out).toBe('["alpha","beta"]');
+  });
+
+  it("handles strings with escaped quotes", () => {
+    const schema = { type: "array", prefixItems: [{ type: "string" }] };
+    const input = '{"0":"say \\"hi\\""}';
+    expect(decode(schema, input)).toBe('["say \\"hi\\""]');
+  });
+
+  it("handles nested object values", () => {
+    const schema = {
+      type: "array",
+      prefixItems: [
+        { type: "object", properties: { x: { type: "number" } } },
+        { type: "string" },
+      ],
+    };
+    const input = '{"0":{"x":1},"1":"ok"}';
+    expect(decode(schema, input)).toBe('[{"x":1},"ok"]');
+  });
+
+  it("handles nested array values", () => {
+    const schema = {
+      type: "array",
+      prefixItems: [{ type: "array", items: { type: "number" } }, { type: "number" }],
+    };
+    const input = '{"0":[1,2,3],"1":99}';
+    expect(decode(schema, input)).toBe('[[1,2,3],99]');
+  });
+
+  it("reconverts nested tuple in a value", () => {
+    const schema = {
+      type: "array",
+      prefixItems: [
+        {
+          type: "array",
+          prefixItems: [{ type: "number" }, { type: "number" }],
+        },
+        { type: "string" },
+      ],
+    };
+    // Inner tuple was also converted to object on the way in
+    const input = '{"0":{"0":10,"1":20},"1":"label"}';
+    expect(decode(schema, input)).toBe('[[10,20],"label"]');
+  });
+
+  it("flush() emits closing bracket for truncated stream", () => {
+    const schema = { type: "array", prefixItems: [{ type: "string" }] };
+    const dec = new TupleStreamDecoder(schema);
+    dec.push('{"0":"incomplete'); // stream cut short
+    expect(dec.flush()).toBe("]");
+  });
+
+  it("flush() emits nothing when stream is complete", () => {
+    const schema = { type: "array", prefixItems: [{ type: "number" }] };
+    const dec = new TupleStreamDecoder(schema);
+    dec.push('{"0":1}');
+    expect(dec.flush()).toBe("");
+  });
+
+  it("handles whitespace around values", () => {
+    const schema = { type: "array", prefixItems: [{ type: "string" }, { type: "number" }] };
+    const input = '{ "0" : "hi" , "1" : 7 }';
+    expect(decode(schema, input)).toBe('["hi",7]');
   });
 });
