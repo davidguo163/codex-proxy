@@ -22,12 +22,13 @@ function isHttps(c: Context): boolean {
 }
 
 /** Paths that are always allowed through without dashboard session. */
-const ALLOWED_PREFIXES = ["/assets/", "/v1/", "/v1beta/", "/official-agent/"];
+const ALLOWED_PREFIXES = ["/assets/", "/v1/", "/v1beta/", "/official-agent/", "/api/codex/"];
 const ALLOWED_EXACT = new Set([
   "/health",
   "/auth/dashboard-login",
   "/auth/dashboard-logout",
   "/auth/dashboard-status",
+  "/codex/device",
 ]);
 /** GET-only paths allowed (HTML shell must load to render login form). */
 const ALLOWED_GET_EXACT = new Set(["/"]);
