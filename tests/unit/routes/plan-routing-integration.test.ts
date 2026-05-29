@@ -96,6 +96,7 @@ vi.mock("@src/utils/retry.js", () => ({
 import { AccountPool } from "@src/auth/account-pool.js";
 import {
   loadStaticModels,
+  applyBackendModels,
   applyBackendModelsForPlan,
 } from "@src/models/model-store.js";
 import { extractUserProfile } from "@src/auth/jwt-utils.js";
@@ -332,6 +333,76 @@ describe("GET /v1/models with runtime API keys", () => {
 
     expect(body.data.some((m: { id: string }) => m.id === "my-runtime-model")).toBe(true);
     expect(body.data.some((m: { id: string }) => m.id === "gpt-5.4")).toBe(true);
+    expect(body.models).toBeUndefined();
+  });
+
+  it("also returns Codex-compatible models metadata for Codex CLI refresh", async () => {
+    const pool = new ApiKeyPool(createApiKeyMemoryPersistence());
+    pool.add({ provider: "custom", model: "my-runtime-model", apiKey: "k2", baseUrl: "https://example.com/v1" });
+
+    const app = createModelRoutes(pool);
+    const res = await app.request("/v1/models?client_version=0.0.0");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.object).toBe("list");
+    expect(body.data.some((m: { id: string }) => m.id === "my-runtime-model")).toBe(true);
+    expect(body.models.some((m: { slug: string }) => m.slug === "my-runtime-model")).toBe(true);
+    expect(body.models[0]).toMatchObject({
+      shell_type: "shell_command",
+      visibility: "list",
+      supported_in_api: true,
+      truncation_policy: { mode: "tokens" },
+      input_modalities: ["text"],
+    });
+  });
+
+  it("normalizes Codex metadata enum fields and keeps runtime models after catalog priority", async () => {
+    applyBackendModels([
+      {
+        slug: "default-model",
+        is_default: true,
+        default_reasoning_effort: "turbo",
+        supported_reasoning_efforts: [
+          { effort: "turbo", description: "unsupported" },
+          { effort: "high", description: "High" },
+        ],
+        input_modalities: ["text", "audio", "image"],
+      },
+      {
+        slug: "other-model",
+        supported_reasoning_efforts: [{ effort: "unknown", description: "unsupported" }],
+        input_modalities: ["audio"],
+      },
+    ]);
+    const pool = new ApiKeyPool(createApiKeyMemoryPersistence());
+    pool.add({ provider: "custom", model: "runtime-model", apiKey: "k2", baseUrl: "https://example.com/v1" });
+
+    const app = createModelRoutes(pool);
+    const res = await app.request("/v1/models?client_version=0.0.0");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const models = body.models as Array<{
+      slug: string;
+      priority: number;
+      default_reasoning_level: string;
+      supported_reasoning_levels: Array<{ effort: string }>;
+      input_modalities: string[];
+    }>;
+    const bySlug = new Map(models.map((model) => [model.slug, model]));
+
+    expect(bySlug.get("default-model")).toMatchObject({
+      priority: 0,
+      default_reasoning_level: "high",
+      supported_reasoning_levels: [{ effort: "high" }],
+      input_modalities: ["text", "image"],
+    });
+    expect(bySlug.get("other-model")).toMatchObject({
+      default_reasoning_level: "none",
+      supported_reasoning_levels: [{ effort: "none" }],
+      input_modalities: ["text"],
+    });
+    expect(bySlug.get("runtime-model")!.priority).toBeGreaterThan(bySlug.get("other-model")!.priority);
   });
 
   it("excludes disabled API key models from /v1/models", async () => {
