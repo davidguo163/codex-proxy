@@ -18,6 +18,8 @@ import type { CodexResponsesRequest } from "../proxy/codex-types.js";
 import { applyParsedRateLimits } from "./shared/proxy-rate-limit.js";
 import { extractImageGenUsage, extractResponseUsage } from "./responses.js";
 import { logProxyUsage } from "./shared/proxy-usage-log.js";
+import { buildWsPoolContext } from "./shared/proxy-ws-context.js";
+import { computeVariantHash } from "./shared/variant-hash.js";
 import type { UsageInfo } from "../translation/codex-event-extractor.js";
 
 interface BridgeDeps {
@@ -43,8 +45,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+function firstHeaderValue(header: string | string[] | undefined): string | undefined {
+  return Array.isArray(header) ? header[0] : header;
+}
+
 function bearerToken(header: string | string[] | undefined): string | null {
-  const value = Array.isArray(header) ? header[0] : header;
+  const value = firstHeaderValue(header);
   const prefix = "Bearer ";
   return value?.startsWith(prefix) ? value.slice(prefix.length) : null;
 }
@@ -83,7 +89,9 @@ function toCodexRequest(payload: Record<string, unknown>): CodexResponsesRequest
     parallel_tool_calls: typeof payload.parallel_tool_calls === "boolean" ? payload.parallel_tool_calls : undefined,
     text: payload.text && typeof payload.text === "object" ? payload.text as any : undefined,
     previous_response_id: typeof payload.previous_response_id === "string" ? payload.previous_response_id : undefined,
-    prompt_cache_key: typeof clientMetadata["x-client-request-id"] === "string" ? clientMetadata["x-client-request-id"] : undefined,
+    prompt_cache_key: typeof payload.prompt_cache_key === "string"
+      ? payload.prompt_cache_key
+      : typeof clientMetadata["x-client-request-id"] === "string" ? clientMetadata["x-client-request-id"] : undefined,
     client_metadata: clientMetadata,
     include: Array.isArray(payload.include) ? payload.include.filter((x): x is string => typeof x === "string") : undefined,
     useWebSocket: true,
@@ -95,7 +103,18 @@ function toCodexRequest(payload: Record<string, unknown>): CodexResponsesRequest
   };
 }
 
-async function bridgeSingleRequest(ws: WebSocket, payload: Record<string, unknown>, req: IncomingMessage, deps: BridgeDeps) {
+interface ResponsesWsSessionState {
+  conversationId: string;
+  entryId?: string;
+}
+
+async function bridgeSingleRequest(
+  ws: WebSocket,
+  payload: Record<string, unknown>,
+  req: IncomingMessage,
+  deps: BridgeDeps,
+  session: ResponsesWsSessionState,
+) {
   const model = typeof payload.model === "string" ? payload.model : null;
   if (!model) {
     sendJson(ws, buildError("Missing model", "invalid_request"));
@@ -110,15 +129,22 @@ async function bridgeSingleRequest(ws: WebSocket, payload: Record<string, unknow
   }
 
   const codexRequest = toCodexRequest(payload);
-  const acquired = acquireAccount(deps.accountPool, codexRequest.model, undefined, "ResponsesWS", codexRequest.prompt_cache_key);
+  const acquired = acquireAccount(deps.accountPool, codexRequest.model, undefined, "ResponsesWS", session.entryId);
   if (!acquired) {
     sendJson(ws, buildError("No available accounts. All accounts are expired or rate-limited.", "no_available_accounts", "server_error"));
     return;
   }
+  if (session.entryId && acquired.entryId !== session.entryId) {
+    deps.accountPool.releaseWithoutCounting(acquired.entryId);
+    sendJson(ws, buildError("Pinned websocket session account is no longer available.", "session_account_unavailable", "server_error"));
+    return;
+  }
+  session.entryId = acquired.entryId;
 
   const released = new Set<string>();
   let usageInfo: UsageInfo | undefined;
-  const requestId = (req.headers["x-client-request-id"] as string) || randomUUID().slice(0, 8);
+  const requestId = firstHeaderValue(req.headers["x-client-request-id"]) || randomUUID().slice(0, 8);
+  const conversationId = codexRequest.prompt_cache_key ?? session.conversationId;
   enqueueLogEntry({
     requestId,
     direction: "ingress",
@@ -144,7 +170,14 @@ async function bridgeSingleRequest(ws: WebSocket, payload: Record<string, unknow
       codexRequest,
       abortController.signal,
       (rateLimits) => applyParsedRateLimits({ accountPool: deps.accountPool, entryId: acquired.entryId, rateLimits }),
-      undefined,
+      buildWsPoolContext({
+        useWebSocket: codexRequest.useWebSocket,
+        conversationId,
+        entryId: acquired.entryId,
+        variantHash: computeVariantHash(codexRequest.instructions, codexRequest.tools, codexRequest.model),
+        requestId,
+        tag: "ResponsesWS",
+      }),
     );
     recordProxyEgressLog({
       requestId,
@@ -187,19 +220,30 @@ async function bridgeSingleRequest(ws: WebSocket, payload: Record<string, unknow
 
 function attachWsBridge(wss: WebSocketServer, deps: BridgeDeps): void {
   wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
-    ws.on("message", async (raw) => {
-      let payload: Record<string, unknown>;
-      try {
-        payload = JSON.parse(raw.toString()) as Record<string, unknown>;
-      } catch {
-        sendJson(ws, buildError("Malformed JSON websocket request body", "invalid_json"));
-        return;
-      }
-      if (payload.type !== "response.create") {
-        sendJson(ws, buildError("Only response.create is supported", "unsupported_type"));
-        return;
-      }
-      await bridgeSingleRequest(ws, payload, req, deps);
+    const session: ResponsesWsSessionState = {
+      conversationId: firstHeaderValue(req.headers["x-client-request-id"]) || randomUUID().slice(0, 8),
+    };
+    let queue = Promise.resolve();
+
+    ws.on("message", (raw) => {
+      queue = queue.then(async () => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        let payload: Record<string, unknown>;
+        try {
+          payload = JSON.parse(raw.toString()) as Record<string, unknown>;
+        } catch {
+          sendJson(ws, buildError("Malformed JSON websocket request body", "invalid_json"));
+          return;
+        }
+        if (payload.type !== "response.create") {
+          sendJson(ws, buildError("Only response.create is supported", "unsupported_type"));
+          return;
+        }
+        await bridgeSingleRequest(ws, payload, req, deps, session);
+      }).catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        sendJson(ws, buildError(message, "bridge_queue_error", "server_error"));
+      });
     });
   });
 }
