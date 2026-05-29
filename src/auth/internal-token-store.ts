@@ -50,6 +50,7 @@ interface DeviceSession {
   expiresAtMs: number;
   approvedAtMs?: number;
   email?: string;
+  accountId?: string;
 }
 
 interface AccessSession {
@@ -82,6 +83,11 @@ interface SignedRefreshPayload {
   accountId: string;
   exp: number;
   jti: string;
+}
+
+export interface InternalApprovalIdentity {
+  email?: string | null;
+  accountId?: string | null;
 }
 
 const DEVICE_TTL_MS = 15 * 60 * 1000;
@@ -204,7 +210,10 @@ export class InternalTokenStore {
     };
   }
 
-  approve(userCode: string, email = DEV_EMAIL): { ok: true } | { ok: false; error: string } {
+  approve(
+    userCode: string,
+    identity: string | InternalApprovalIdentity = DEV_EMAIL,
+  ): { ok: true } | { ok: false; error: string } {
     this.cleanupExpired();
     const normalized = userCode.trim().toUpperCase();
     const session = this.deviceByUserCode.get(normalized);
@@ -212,7 +221,8 @@ export class InternalTokenStore {
     if (session.status !== "pending") return { ok: false, error: `code_${session.status}` };
     session.status = "approved";
     session.approvedAtMs = Date.now();
-    session.email = email;
+    session.email = typeof identity === "string" ? identity : identity.email ?? DEV_EMAIL;
+    session.accountId = typeof identity === "string" ? DEV_ACCOUNT_ID : identity.accountId ?? DEV_ACCOUNT_ID;
     return { ok: true };
   }
 
@@ -226,7 +236,15 @@ export class InternalTokenStore {
     if (session.status === "consumed") return { ok: false, status: 400, error: "code_already_consumed" };
 
     session.status = "consumed";
-    return { ok: true, payload: this.issueNewRefreshSession(headers, fallbackHost, session.email ?? DEV_EMAIL) };
+    return {
+      ok: true,
+      payload: this.issueNewRefreshSession(
+        headers,
+        fallbackHost,
+        session.email ?? DEV_EMAIL,
+        session.accountId ?? DEV_ACCOUNT_ID,
+      ),
+    };
   }
 
   pollAuthorizationCode(deviceCode: string, userCode: string):
@@ -250,7 +268,7 @@ export class InternalTokenStore {
       codeVerifier,
       codeChallenge,
       email: session.email ?? DEV_EMAIL,
-      accountId: DEV_ACCOUNT_ID,
+      accountId: session.accountId ?? DEV_ACCOUNT_ID,
       expiresAtMs: Date.now() + AUTH_CODE_TTL_MS,
     });
     return {
