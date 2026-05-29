@@ -33,6 +33,13 @@ export interface AuthorizationCodePayload {
   code_verifier: string;
 }
 
+export const INTERNAL_TOKEN_SESSION_LIMITS = {
+  maxDeviceSessions: 1000,
+  maxAccessSessions: 2000,
+  maxRefreshSessions: 2000,
+  maxAuthorizationCodeSessions: 1000,
+} as const;
+
 type DeviceSessionStatus = "pending" | "approved" | "consumed";
 
 interface DeviceSession {
@@ -50,6 +57,14 @@ interface AccessSession {
   email: string;
   accountId: string;
   expiresAtMs: number;
+}
+
+interface RefreshSession {
+  refreshToken: string;
+  email: string;
+  accountId: string;
+  expiresAtMs: number;
+  currentAccessToken: string | null;
 }
 
 interface AuthorizationSession {
@@ -76,9 +91,6 @@ const REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const POLL_INTERVAL_SECONDS = 5;
 const DEV_EMAIL = "dev@topgamesinc.com";
 const DEV_ACCOUNT_ID = "emp_dev_codex_proxy";
-const MAX_DEVICE_SESSIONS = 1000;
-const MAX_ACCESS_SESSIONS = 2000;
-const MAX_AUTH_CODE_SESSIONS = 1000;
 const ISSUER = "topgames_internal_dev";
 
 function randomToken(prefix: string): string {
@@ -107,7 +119,17 @@ function parseBase64urlJson<T>(value: string): T | null {
 }
 
 function signingSecret(): string {
-  return process.env.CODEX_INTERNAL_TOKEN_SECRET || getConfig().server.proxy_api_key || "codex-proxy-dev-internal-token-secret";
+  let configKey = "";
+  try {
+    configKey = getConfig().server.proxy_api_key ?? "";
+  } catch {
+    configKey = "";
+  }
+  const secret = process.env.CODEX_INTERNAL_TOKEN_SECRET || configKey;
+  if (!secret) {
+    throw new Error("Internal token signing secret is not configured");
+  }
+  return secret;
 }
 
 function sign(parts: string): string {
@@ -150,6 +172,7 @@ export class InternalTokenStore {
   private deviceByCode = new Map<string, DeviceSession>();
   private deviceByUserCode = new Map<string, DeviceSession>();
   private accessSessions = new Map<string, AccessSession>();
+  private refreshSessions = new Map<string, RefreshSession>();
   private authorizationSessions = new Map<string, AuthorizationSession>();
 
   start(headers: Headers, fallbackHost: string): DeviceLoginStart {
@@ -203,7 +226,7 @@ export class InternalTokenStore {
     if (session.status === "consumed") return { ok: false, status: 400, error: "code_already_consumed" };
 
     session.status = "consumed";
-    return { ok: true, payload: this.issue(headers, fallbackHost, session.email ?? DEV_EMAIL) };
+    return { ok: true, payload: this.issueNewRefreshSession(headers, fallbackHost, session.email ?? DEV_EMAIL) };
   }
 
   pollAuthorizationCode(deviceCode: string, userCode: string):
@@ -248,7 +271,7 @@ export class InternalTokenStore {
     if (!session) return { ok: false, error: "invalid_grant" };
     if (session.codeVerifier !== codeVerifier) return { ok: false, error: "invalid_grant" };
     this.authorizationSessions.delete(session.code);
-    return { ok: true, payload: this.issue(headers, fallbackHost, session.email, session.accountId) };
+    return { ok: true, payload: this.issueNewRefreshSession(headers, fallbackHost, session.email, session.accountId) };
   }
 
   refresh(refreshToken: string, headers: Headers, fallbackHost: string):
@@ -259,7 +282,20 @@ export class InternalTokenStore {
     if (!payload || payload.typ !== "itg_refresh" || payload.exp <= Math.floor(Date.now() / 1000)) {
       return { ok: false, error: "invalid_grant" };
     }
-    return { ok: true, payload: this.issue(headers, fallbackHost, payload.email, payload.accountId) };
+    const refreshTokenValue = refreshToken.trim();
+    let refreshSession = this.refreshSessions.get(payload.jti);
+    if (!refreshSession) {
+      this.evictRefreshSessionsIfNeeded();
+      refreshSession = {
+        refreshToken: refreshTokenValue,
+        email: payload.email,
+        accountId: payload.accountId,
+        expiresAtMs: payload.exp * 1000,
+        currentAccessToken: null,
+      };
+      this.refreshSessions.set(payload.jti, refreshSession);
+    }
+    return { ok: true, payload: this.issueAccessForRefreshSession(headers, fallbackHost, refreshSession) };
   }
 
   validateAccessToken(token: string): boolean {
@@ -268,61 +304,84 @@ export class InternalTokenStore {
     return session !== undefined && session.expiresAtMs > Date.now();
   }
 
-  private issue(
+  private issueNewRefreshSession(
     headers: Headers,
     fallbackHost: string,
     email: string,
     accountId = DEV_ACCOUNT_ID,
   ): InternalAuthPayload {
-    this.evictAccessSessionsIfNeeded();
-    const origin = originFromRequest(headers, fallbackHost);
     const now = Date.now();
-    const accessToken = randomToken("itg_access");
     const refreshExp = Math.floor((now + REFRESH_TTL_MS) / 1000);
+    const refreshJti = randomBytes(16).toString("base64url");
     const refreshToken = signedToken("itg_refresh", {
       typ: "itg_refresh",
       email,
       accountId,
       exp: refreshExp,
-      jti: randomBytes(16).toString("base64url"),
+      jti: refreshJti,
     } satisfies SignedRefreshPayload);
+    const refreshSession: RefreshSession = {
+      refreshToken,
+      email,
+      accountId,
+      expiresAtMs: refreshExp * 1000,
+      currentAccessToken: null,
+    };
+    this.evictRefreshSessionsIfNeeded();
+    this.refreshSessions.set(refreshJti, refreshSession);
+    return this.issueAccessForRefreshSession(headers, fallbackHost, refreshSession);
+  }
+
+  private issueAccessForRefreshSession(
+    headers: Headers,
+    fallbackHost: string,
+    refreshSession: RefreshSession,
+  ): InternalAuthPayload {
+    if (refreshSession.currentAccessToken) {
+      this.accessSessions.delete(refreshSession.currentAccessToken);
+    }
+    this.evictAccessSessionsIfNeeded();
+    const origin = originFromRequest(headers, fallbackHost);
+    const now = Date.now();
+    const accessToken = randomToken("itg_access");
     const idToken = compactJwt({
       iss: ISSUER,
-      sub: accountId,
-      email,
+      sub: refreshSession.accountId,
+      email: refreshSession.email,
       aud: "codex-proxy-dev",
       exp: Math.floor((now + ACCESS_TTL_MS) / 1000),
       iat: Math.floor(now / 1000),
       "https://api.openai.com/profile": {
-        email,
+        email: refreshSession.email,
       },
       "https://api.openai.com/auth": {
         chatgpt_plan_type: "pro",
-        chatgpt_user_id: accountId,
-        user_id: accountId,
-        chatgpt_account_id: accountId,
+        chatgpt_user_id: refreshSession.accountId,
+        user_id: refreshSession.accountId,
+        chatgpt_account_id: refreshSession.accountId,
         chatgpt_account_is_fedramp: false,
       },
     });
     const session: AccessSession = {
       accessToken,
-      email,
-      accountId,
+      email: refreshSession.email,
+      accountId: refreshSession.accountId,
       expiresAtMs: now + ACCESS_TTL_MS,
     };
     this.accessSessions.set(accessToken, session);
+    refreshSession.currentAccessToken = accessToken;
     return {
       access_token: accessToken,
-      refresh_token: refreshToken,
+      refresh_token: refreshSession.refreshToken,
       id_token: idToken,
       expires_in: ACCESS_TTL_MS / 1000,
       token_type: "Bearer",
       accessToken,
-      refreshToken,
+      refreshToken: refreshSession.refreshToken,
       idToken,
       expiresAt: Math.floor(session.expiresAtMs / 1000),
-      accountId,
-      email,
+      accountId: refreshSession.accountId,
+      email: refreshSession.email,
       tokenEndpoint: `${origin}/oauth/token`,
       apiBaseUrl: `${origin}/openai/v1`,
       issuer: ISSUER,
@@ -340,13 +399,19 @@ export class InternalTokenStore {
     for (const [token, session] of this.accessSessions.entries()) {
       if (session.expiresAtMs <= now) this.accessSessions.delete(token);
     }
+    for (const [jti, session] of this.refreshSessions.entries()) {
+      if (session.expiresAtMs <= now) {
+        if (session.currentAccessToken) this.accessSessions.delete(session.currentAccessToken);
+        this.refreshSessions.delete(jti);
+      }
+    }
     for (const [code, session] of this.authorizationSessions.entries()) {
       if (session.expiresAtMs <= now) this.authorizationSessions.delete(code);
     }
   }
 
   private evictDeviceSessionsIfNeeded(): void {
-    while (this.deviceByCode.size >= MAX_DEVICE_SESSIONS) {
+    while (this.deviceByCode.size >= INTERNAL_TOKEN_SESSION_LIMITS.maxDeviceSessions) {
       const oldest = this.deviceByCode.values().next().value as DeviceSession | undefined;
       if (!oldest) return;
       this.deviceByCode.delete(oldest.deviceCode);
@@ -355,15 +420,25 @@ export class InternalTokenStore {
   }
 
   private evictAccessSessionsIfNeeded(): void {
-    while (this.accessSessions.size >= MAX_ACCESS_SESSIONS) {
+    while (this.accessSessions.size >= INTERNAL_TOKEN_SESSION_LIMITS.maxAccessSessions) {
       const oldest = this.accessSessions.keys().next().value as string | undefined;
       if (!oldest) return;
       this.accessSessions.delete(oldest);
     }
   }
 
+  private evictRefreshSessionsIfNeeded(): void {
+    while (this.refreshSessions.size >= INTERNAL_TOKEN_SESSION_LIMITS.maxRefreshSessions) {
+      const oldestJti = this.refreshSessions.keys().next().value as string | undefined;
+      if (!oldestJti) return;
+      const oldest = this.refreshSessions.get(oldestJti);
+      if (oldest?.currentAccessToken) this.accessSessions.delete(oldest.currentAccessToken);
+      this.refreshSessions.delete(oldestJti);
+    }
+  }
+
   private evictAuthorizationSessionsIfNeeded(): void {
-    while (this.authorizationSessions.size >= MAX_AUTH_CODE_SESSIONS) {
+    while (this.authorizationSessions.size >= INTERNAL_TOKEN_SESSION_LIMITS.maxAuthorizationCodeSessions) {
       const oldest = this.authorizationSessions.keys().next().value as string | undefined;
       if (!oldest) return;
       this.authorizationSessions.delete(oldest);
