@@ -1,7 +1,7 @@
 import "./utils/install-dev-logger.js";
 
 import { Hono } from "hono";
-import { serve } from "@hono/node-server";
+import { serve, createAdaptorServer } from "@hono/node-server";
 import { loadConfig, loadFingerprint, getConfig, hasLocalOverride } from "./config.js";
 import { initContext } from "./context.js";
 import { AccountPool } from "./auth/account-pool.js";
@@ -27,6 +27,7 @@ import { ProxyPool } from "./proxy/proxy-pool.js";
 import { setWsPoolConfig, getWsPool } from "./proxy/ws-pool.js";
 import { createProxyRoutes } from "./routes/proxies.js";
 import { createResponsesRoutes } from "./routes/responses.js";
+import { createResponsesWsRoutes, installResponsesWsBridge } from "./routes/responses-ws.js";
 import { startUpdateChecker, stopUpdateChecker } from "./update-checker.js";
 import { startProxyUpdateChecker, stopProxyUpdateChecker, setCloseHandler, getDeployMode } from "./self-update.js";
 import { initProxy } from "./tls/proxy.js";
@@ -172,6 +173,7 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   const messagesRoutes = createMessagesRoutes(accountPool, cookieJar, proxyPool, upstreamRouter);
   const geminiRoutes = createGeminiRoutes(accountPool, cookieJar, proxyPool, upstreamRouter);
   const responsesRoutes = createResponsesRoutes(accountPool, cookieJar, proxyPool, upstreamRouter);
+  const responsesWsRoutes = createResponsesWsRoutes(accountPool, cookieJar, proxyPool, upstreamRouter);
   const modelRoutes = createModelRoutes(apiKeyPool);
   const apiKeyRoutes = createApiKeyRoutes(apiKeyPool);
   const embeddingsRoutes = createEmbeddingsRoutes(accountPool, apiKeyPool);
@@ -193,6 +195,7 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   app.route("/", responsesRoutes);
   app.route("/openai", chatRoutes);
   app.route("/openai", responsesRoutes);
+  app.route("/", responsesWsRoutes);
   app.route("/", createOfficialAgentRoutes());
   app.route("/", proxyRoutes);
   app.route("/", modelRoutes);
@@ -249,11 +252,12 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   // Start proxy health check timer (if proxies exist)
   proxyPool.startHealthCheckTimer();
 
-  const server = serve({
+  const server = createAdaptorServer({
     fetch: app.fetch,
     hostname: host,
-    port,
   });
+  const responsesWsBridge = installResponsesWsBridge(server as any, { accountPool, cookieJar, proxyPool, upstreamRouter });
+  server.listen(port, host);
 
   // `serve()` returns synchronously before `listen()` actually binds.
   // Wait for the listening event (or surface bind errors as a real
@@ -270,6 +274,7 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
 
   const close = async (): Promise<void> => {
     await stopOllamaBridge();
+    await responsesWsBridge.close();
     return new Promise((resolve) => {
       server.close(() => {
         stopUpdateChecker();
