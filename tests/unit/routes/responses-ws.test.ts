@@ -45,6 +45,7 @@ const buildCodexApiMock = vi.mocked(proxyHandlerUtils.buildCodexApi);
 function mockPool() {
   return {
     validateProxyApiKey: vi.fn((key: string) => key === "proxy-secret"),
+    releaseWithoutCounting: vi.fn(),
   } as any;
 }
 
@@ -81,6 +82,28 @@ function waitForOpen(ws: WebSocket): Promise<void> {
 function waitForMessage(ws: WebSocket): Promise<Record<string, any>> {
   return new Promise((resolve, reject) => {
     ws.once("message", (raw) => resolve(JSON.parse(raw.toString())));
+    ws.once("error", reject);
+  });
+}
+
+function waitForMessages(
+  ws: WebSocket,
+  predicate: (message: Record<string, any>) => boolean,
+  count: number,
+): Promise<Record<string, any>[]> {
+  return new Promise((resolve, reject) => {
+    const matches: Record<string, any>[] = [];
+    const onMessage = (raw: WebSocket.RawData) => {
+      const message = JSON.parse(raw.toString());
+      if (!predicate(message)) return;
+      matches.push(message);
+      if (matches.length === count) {
+        ws.off("message", onMessage);
+        ws.off("error", reject);
+        resolve(matches);
+      }
+    };
+    ws.on("message", onMessage);
     ws.once("error", reject);
   });
 }
@@ -216,6 +239,7 @@ describe("responses websocket bridge", () => {
         type: "response.create",
         model: "gpt-5.3-codex",
         instructions: "system",
+        prompt_cache_key: "top-level-prompt-cache",
         previous_response_id: "resp_previous",
         input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
       }));
@@ -226,16 +250,166 @@ describe("responses websocket bridge", () => {
       });
       const [request, signal] = createResponse.mock.calls[0]!;
       expect(request).toMatchObject({
+        prompt_cache_key: "top-level-prompt-cache",
         previous_response_id: "resp_previous",
         useWebSocket: true,
       });
       expect(signal.aborted).toBe(false);
+      expect(createResponse.mock.calls[0]![3]).toMatchObject({
+        entryId: "entry-1",
+        poolKey: expect.stringContaining("entry-1:top-level-prompt-cache:"),
+      });
       expect(releaseAccountMock).toHaveBeenCalledWith(
         expect.anything(),
         "entry-1",
         { input_tokens: 12, output_tokens: 3, cached_tokens: 4 },
         expect.any(Set),
       );
+      ws.close();
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it("pins a websocket session to one account and serializes tool continuation requests", async () => {
+    let releaseFirstResponse!: () => void;
+    let firstReleased = false;
+    let prematureSecondRequest = false;
+    const firstResponseCanFinish = new Promise<void>((resolve) => {
+      releaseFirstResponse = () => {
+        firstReleased = true;
+        resolve();
+      };
+    });
+    const createResponse = vi.fn<CodexApi["createResponse"]>(async () => {
+      if (createResponse.mock.calls.length === 2 && !firstReleased) {
+        prematureSecondRequest = true;
+        throw new Error("premature_second_request");
+      }
+      return new Response("ok", { status: 200 });
+    });
+    const parseStream = vi.fn(async function* () {
+      const callNumber = parseStream.mock.calls.length;
+      if (callNumber === 1) {
+        yield { event: "response.created", data: { type: "response.created", response: { id: "resp_1" } } };
+        await firstResponseCanFinish;
+        yield {
+          event: "response.completed",
+          data: {
+            type: "response.completed",
+            response: { id: "resp_1", usage: { input_tokens: 10, output_tokens: 1 } },
+          },
+        };
+        return;
+      }
+      yield { event: "response.created", data: { type: "response.created", response: { id: "resp_2" } } };
+      yield {
+        event: "response.completed",
+        data: {
+          type: "response.completed",
+          response: { id: "resp_2", usage: { input_tokens: 5, output_tokens: 2 } },
+        },
+      };
+    });
+    acquireAccountMock.mockImplementation((_pool, _model, _excludeIds, _tag, preferredEntryId) => ({
+      entryId: preferredEntryId === undefined || preferredEntryId === "entry-1" ? "entry-1" : "entry-2",
+      token: "token-1",
+      accountId: "acct-1",
+      prevSlotMs: null,
+    }));
+    buildCodexApiMock.mockReturnValue({ createResponse, parseStream } as unknown as CodexApi);
+
+    const bridge = await startBridge();
+    try {
+      const ws = new WebSocket(`${bridge.url}/openai/v1/responses`, {
+        headers: { Authorization: "Bearer proxy-secret" },
+      });
+      await waitForOpen(ws);
+      const firstCreated = waitForMessages(ws, (message) => message.type === "response.created", 1);
+      const completions = waitForMessages(ws, (message) => message.type === "response.completed", 2);
+
+      ws.send(JSON.stringify({
+        type: "response.create",
+        model: "gpt-5.3-codex",
+        instructions: "system",
+        input: [{ role: "user", content: [{ type: "input_text", text: "run a tool" }] }],
+      }));
+      await expect(firstCreated).resolves.toHaveLength(1);
+      expect(createResponse).toHaveBeenCalledTimes(1);
+
+      ws.send(JSON.stringify({
+        type: "response.create",
+        model: "gpt-5.3-codex",
+        instructions: "system",
+        previous_response_id: "resp_1",
+        input: [{ type: "function_call_output", call_id: "call_1", output: "tool ok" }],
+      }));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(createResponse).toHaveBeenCalledTimes(1);
+      releaseFirstResponse();
+      await expect(completions).resolves.toHaveLength(2);
+      expect(prematureSecondRequest).toBe(false);
+
+      expect(acquireAccountMock).toHaveBeenNthCalledWith(1, expect.anything(), "gpt-5.3-codex", undefined, "ResponsesWS", undefined);
+      expect(acquireAccountMock).toHaveBeenNthCalledWith(2, expect.anything(), "gpt-5.3-codex", undefined, "ResponsesWS", "entry-1");
+      expect(buildCodexApiMock).toHaveBeenNthCalledWith(1, "token-1", "acct-1", undefined, "entry-1", undefined);
+      expect(buildCodexApiMock).toHaveBeenNthCalledWith(2, "token-1", "acct-1", undefined, "entry-1", undefined);
+      expect(createResponse.mock.calls[1]![0]).toMatchObject({
+        previous_response_id: "resp_1",
+        useWebSocket: true,
+      });
+      const firstContext = createResponse.mock.calls[0]![3];
+      const secondContext = createResponse.mock.calls[1]![3];
+      expect(firstContext).toMatchObject({ entryId: "entry-1" });
+      expect(secondContext).toMatchObject({ entryId: "entry-1" });
+      expect(secondContext?.poolKey).toBe(firstContext?.poolKey);
+      ws.close();
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it("fails continuation instead of rotating to a different account", async () => {
+    const createResponse = vi.fn<CodexApi["createResponse"]>(async () => new Response("ok", { status: 200 }));
+    const parseStream = vi.fn(async function* () {
+      yield {
+        event: "response.completed",
+        data: { type: "response.completed", response: { id: "resp_1" } },
+      };
+    });
+    acquireAccountMock
+      .mockReturnValueOnce({ entryId: "entry-1", token: "token-1", accountId: "acct-1", prevSlotMs: null })
+      .mockReturnValueOnce({ entryId: "entry-2", token: "token-2", accountId: "acct-2", prevSlotMs: null });
+    buildCodexApiMock.mockReturnValue({ createResponse, parseStream } as unknown as CodexApi);
+
+    const pool = mockPool();
+    const bridge = await startBridge(pool);
+    try {
+      const ws = new WebSocket(`${bridge.url}/openai/v1/responses`, {
+        headers: { Authorization: "Bearer proxy-secret" },
+      });
+      await waitForOpen(ws);
+      ws.send(JSON.stringify({
+        type: "response.create",
+        model: "gpt-5.3-codex",
+        input: [],
+      }));
+      await waitForMessages(ws, (message) => message.type === "response.completed", 1);
+
+      ws.send(JSON.stringify({
+        type: "response.create",
+        model: "gpt-5.3-codex",
+        previous_response_id: "resp_1",
+        input: [{ type: "function_call_output", call_id: "call_1", output: "tool ok" }],
+      }));
+      const error = await waitForMessage(ws);
+      expect(error).toMatchObject({
+        type: "error",
+        error: { code: "session_account_unavailable" },
+      });
+      expect(buildCodexApiMock).toHaveBeenCalledTimes(1);
+      expect(pool.releaseWithoutCounting).toHaveBeenCalledWith("entry-2");
       ws.close();
     } finally {
       await bridge.close();
