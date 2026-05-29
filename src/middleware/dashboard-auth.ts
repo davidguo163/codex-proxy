@@ -31,7 +31,7 @@ const ALLOWED_EXACT = new Set([
   "/oauth/token",
 ]);
 /** GET-only paths allowed (HTML shell must load to render login form). */
-const ALLOWED_GET_EXACT = new Set(["/", "/codex/device"]);
+const ALLOWED_GET_EXACT = new Set(["/", "/codex/device", "/codex/device/callback"]);
 
 
 export async function dashboardAuth(c: Context, next: Next): Promise<Response | void> {
