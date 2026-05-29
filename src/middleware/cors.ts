@@ -36,6 +36,7 @@ export const cors: MiddlewareHandler = async (c, next) => {
 
 function isCorsEnabledPath(path: string): boolean {
   return path.startsWith("/v1/") ||
+    path.startsWith("/openai/v1/") ||
     path.startsWith("/v1beta/") ||
     path === "/responses" ||
     path.startsWith("/responses/") ||

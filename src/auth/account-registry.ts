@@ -9,6 +9,7 @@ import { randomBytes } from "crypto";
 import { readFileSync } from "fs";
 import { resolve } from "path";
 import { getConfig } from "../config.js";
+import { internalTokenStore } from "./internal-token-store.js";
 import { getDataDir } from "../paths.js";
 import { jitter } from "../utils/jitter.js";
 import {
@@ -350,6 +351,7 @@ export class AccountRegistry {
   validateProxyApiKey(key: string): boolean {
     const configKey = getConfig().server.proxy_api_key;
     if (configKey && key === configKey) return true;
+    if (internalTokenStore.validateAccessToken(key)) return true;
     for (const entry of this.accounts.values()) {
       if (entry.proxyApiKey === key) return true;
     }

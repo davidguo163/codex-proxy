@@ -47,6 +47,7 @@ import { createEmbeddingsRoutes } from "./routes/embeddings.js";
 import { createRuntimeUpstreamRouter } from "./proxy/upstream-router-bootstrap.js";
 import { startOllamaBridge, stopOllamaBridge } from "./ollama/server.js";
 import { createOfficialAgentRoutes } from "./routes/official-agent.js";
+import { createInternalDeviceRoutes } from "./routes/internal-device.js";
 import { installUncaughtErrorHandlers } from "./logs/error-log.js";
 import { awaitServerListening } from "./utils/await-listening.js";
 
@@ -170,6 +171,7 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   const messagesRoutes = createMessagesRoutes(accountPool, cookieJar, proxyPool, upstreamRouter);
   const geminiRoutes = createGeminiRoutes(accountPool, cookieJar, proxyPool, upstreamRouter);
   const responsesRoutes = createResponsesRoutes(accountPool, cookieJar, proxyPool, upstreamRouter);
+  const modelRoutes = createModelRoutes(apiKeyPool);
   const apiKeyRoutes = createApiKeyRoutes(apiKeyPool);
   const embeddingsRoutes = createEmbeddingsRoutes(accountPool, apiKeyPool);
   const proxyRoutes = createProxyRoutes(proxyPool, accountPool);
@@ -178,6 +180,7 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   const webRoutes = createWebRoutes(accountPool, usageStats);
 
   app.route("/", createDashboardAuthRoutes());
+  app.route("/", createInternalDeviceRoutes());
   app.route("/", authRoutes);
   app.route("/", accountRoutes);
   app.route("/", apiKeyRoutes);
@@ -186,9 +189,12 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
   app.route("/", messagesRoutes);
   app.route("/", geminiRoutes);
   app.route("/", responsesRoutes);
+  app.route("/openai", chatRoutes);
+  app.route("/openai", responsesRoutes);
   app.route("/", createOfficialAgentRoutes());
   app.route("/", proxyRoutes);
-  app.route("/", createModelRoutes(apiKeyPool));
+  app.route("/", modelRoutes);
+  app.route("/openai", modelRoutes);
   app.route("/", webRoutes);
 
   // Start server

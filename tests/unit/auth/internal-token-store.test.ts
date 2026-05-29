@@ -1,0 +1,98 @@
+import { beforeEach, describe, expect, it } from "vitest";
+import { InternalTokenStore } from "@src/auth/internal-token-store.js";
+
+const headers = new Headers({
+  host: "easyceo.thelightco.net",
+  "x-forwarded-proto": "https",
+});
+
+describe("InternalTokenStore", () => {
+  beforeEach(() => {
+    process.env.CODEX_INTERNAL_TOKEN_SECRET = "test-secret";
+  });
+
+  it("issues an internal token after start, approve, and poll", () => {
+    const store = new InternalTokenStore();
+    const start = store.start(headers, "127.0.0.1:18080");
+
+    expect(start.verificationUri).toBe("https://easyceo.thelightco.net/codex/device");
+    expect(store.poll(start.deviceCode, headers, "127.0.0.1:18080")).toMatchObject({
+      ok: false,
+      status: 428,
+      error: "authorization_pending",
+    });
+
+    expect(store.approve(start.userCode)).toEqual({ ok: true });
+    const result = store.poll(start.deviceCode, headers, "127.0.0.1:18080");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.payload.access_token).toMatch(/^itg_access_/);
+    expect(result.payload.refresh_token).toMatch(/^itg_refresh_/);
+    expect(result.payload.id_token.split(".")).toHaveLength(3);
+    expect(result.payload.apiBaseUrl).toBe("https://easyceo.thelightco.net/openai/v1");
+    expect(store.validateAccessToken(result.payload.access_token)).toBe(true);
+  });
+
+  it("supports the Codex deviceauth authorization-code compatibility flow", () => {
+    const store = new InternalTokenStore();
+    const start = store.start(headers, "127.0.0.1:18080");
+
+    expect(store.pollAuthorizationCode(start.deviceCode, start.userCode)).toMatchObject({
+      ok: false,
+      status: 404,
+      error: "authorization_pending",
+    });
+    expect(store.approve(start.userCode)).toEqual({ ok: true });
+
+    const codeResult = store.pollAuthorizationCode(start.deviceCode, start.userCode);
+    expect(codeResult.ok).toBe(true);
+    if (!codeResult.ok) return;
+    expect(codeResult.payload.authorization_code).toMatch(/^itg_code_/);
+
+    const tokenResult = store.exchangeAuthorizationCode(
+      codeResult.payload.authorization_code,
+      codeResult.payload.code_verifier,
+      headers,
+      "127.0.0.1:18080",
+    );
+    expect(tokenResult.ok).toBe(true);
+    if (!tokenResult.ok) return;
+    expect(tokenResult.payload.access_token).toMatch(/^itg_access_/);
+
+    expect(store.exchangeAuthorizationCode(
+      codeResult.payload.authorization_code,
+      codeResult.payload.code_verifier,
+      headers,
+      "127.0.0.1:18080",
+    )).toEqual({ ok: false, error: "invalid_grant" });
+  });
+
+  it("refresh tokens survive a store instance restart because they are signed", () => {
+    const firstStore = new InternalTokenStore();
+    const start = firstStore.start(headers, "127.0.0.1:18080");
+    expect(firstStore.approve(start.userCode)).toEqual({ ok: true });
+    const pollResult = firstStore.poll(start.deviceCode, headers, "127.0.0.1:18080");
+    expect(pollResult.ok).toBe(true);
+    if (!pollResult.ok) return;
+
+    const restartedStore = new InternalTokenStore();
+    const refreshResult = restartedStore.refresh(
+      pollResult.payload.refresh_token,
+      headers,
+      "127.0.0.1:18080",
+    );
+
+    expect(refreshResult.ok).toBe(true);
+    if (!refreshResult.ok) return;
+    expect(refreshResult.payload.access_token).toMatch(/^itg_access_/);
+    expect(restartedStore.validateAccessToken(refreshResult.payload.access_token)).toBe(true);
+  });
+
+  it("uses http URLs for direct local requests without forwarded proto", () => {
+    const store = new InternalTokenStore();
+    const start = store.start(new Headers({ host: "127.0.0.1:18080" }), "127.0.0.1:18080");
+
+    expect(start.verificationUri).toBe("http://127.0.0.1:18080/codex/device");
+  });
+});
