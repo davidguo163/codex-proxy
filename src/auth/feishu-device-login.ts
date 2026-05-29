@@ -10,10 +10,11 @@ export interface FeishuConfig {
   redirectUri: string;
   allowedEmails: Set<string>;
   allowedEmailDomains: Set<string>;
+  allowedTenantKeys: Set<string>;
 }
 
 export interface FeishuUser {
-  email: string;
+  email: string | null;
   name: string | null;
   openId: string | null;
   unionId: string | null;
@@ -53,6 +54,7 @@ export function getFeishuConfig(): FeishuConfig | null {
     redirectUri,
     allowedEmails: splitCsv(env("FEISHU_ALLOWED_EMAILS")),
     allowedEmailDomains: splitCsv(env("FEISHU_ALLOWED_EMAIL_DOMAINS")),
+    allowedTenantKeys: splitCsv(env("FEISHU_ALLOWED_TENANT_KEYS")),
   };
 }
 
@@ -145,6 +147,28 @@ function assertFeishuSuccess(body: JsonObject, operation: string): JsonObject {
   return asObject(body.data);
 }
 
+function debugValue(value: string | null): string {
+  if (!value) return "missing";
+  if (process.env.FEISHU_DEBUG_IDENTITY_FULL === "1") return value;
+  if (value.includes("@")) return value.replace(/^(.).+(@.*)$/, "$1***$2");
+  return `${value.slice(0, 4)}...${value.slice(-4)}`;
+}
+
+function debugFields(tokenData: JsonObject, userInfo: JsonObject): string {
+  const keys = (value: JsonObject) => Object.keys(value).sort().join(",") || "none";
+  const merged = {
+    email: stringField(userInfo, "email", "enterprise_email") ?? stringField(tokenData, "email", "enterprise_email"),
+    name: stringField(userInfo, "name", "en_name") ?? stringField(tokenData, "name", "en_name"),
+    open_id: stringField(userInfo, "open_id") ?? stringField(tokenData, "open_id"),
+    union_id: stringField(userInfo, "union_id") ?? stringField(tokenData, "union_id"),
+    tenant_key: stringField(userInfo, "tenant_key") ?? stringField(tokenData, "tenant_key"),
+  };
+  return `token_keys=[${keys(tokenData)}]; user_info_keys=[${keys(userInfo)}]; ` +
+    `email=${debugValue(merged.email)}; name=${debugValue(merged.name)}; ` +
+    `open_id=${debugValue(merged.open_id)}; union_id=${debugValue(merged.union_id)}; ` +
+    `tenant_key=${debugValue(merged.tenant_key)}`;
+}
+
 export async function exchangeFeishuCodeForUser(code: string, config: FeishuConfig): Promise<FeishuUser> {
   const tokenResponse = await fetch(config.accessTokenUrl, {
     method: "POST",
@@ -172,26 +196,38 @@ export async function exchangeFeishuCodeForUser(code: string, config: FeishuConf
   if (!userInfoResponse.ok) throw new Error(`feishu_user_info_http_${userInfoResponse.status}`);
   const userInfo = assertFeishuSuccess(userInfoBody, "feishu_user_info");
 
-  const email = stringField(userInfo, "email", "enterprise_email");
-  if (!email) throw new Error("feishu_email_missing");
+  const email = stringField(userInfo, "email", "enterprise_email") ??
+    stringField(tokenData, "email", "enterprise_email");
+  const name = stringField(userInfo, "name", "en_name") ?? stringField(tokenData, "name", "en_name");
+  const openId = stringField(userInfo, "open_id") ?? stringField(tokenData, "open_id");
+  const unionId = stringField(userInfo, "union_id") ?? stringField(tokenData, "union_id");
+  const tenantKey = stringField(userInfo, "tenant_key") ?? stringField(tokenData, "tenant_key");
+  if (!email && !openId && !unionId) {
+    const detail = process.env.FEISHU_DEBUG_IDENTITY === "1" ? `: ${debugFields(tokenData, userInfo)}` : "";
+    throw new Error(`feishu_identity_missing${detail}`);
+  }
+  if (!email && process.env.FEISHU_DEBUG_IDENTITY === "1") {
+    throw new Error(`feishu_email_missing: ${debugFields(tokenData, userInfo)}`);
+  }
   return {
     email,
-    name: stringField(userInfo, "name", "en_name"),
-    openId: stringField(userInfo, "open_id"),
-    unionId: stringField(userInfo, "union_id"),
-    tenantKey: stringField(userInfo, "tenant_key"),
+    name,
+    openId,
+    unionId,
+    tenantKey,
   };
 }
 
 export function isFeishuUserAllowed(user: FeishuUser, config: FeishuConfig): boolean {
-  const email = user.email.toLowerCase();
-  if (config.allowedEmails.size > 0 && config.allowedEmails.has(email)) return true;
+  const email = user.email?.toLowerCase() ?? "";
+  if (email && config.allowedEmails.size > 0 && config.allowedEmails.has(email)) return true;
   const domain = email.split("@")[1] ?? "";
-  if (config.allowedEmailDomains.size > 0 && config.allowedEmailDomains.has(domain)) return true;
+  if (domain && config.allowedEmailDomains.size > 0 && config.allowedEmailDomains.has(domain)) return true;
+  if (!email && user.tenantKey && config.allowedTenantKeys.size > 0 && config.allowedTenantKeys.has(user.tenantKey.toLowerCase())) return true;
   return false;
 }
 
 export function feishuAccountId(user: FeishuUser): string {
-  const rawId = user.unionId ?? user.openId ?? user.email;
+  const rawId = user.unionId ?? user.openId ?? user.email ?? "unknown";
   return `feishu_${rawId.replace(/[^A-Za-z0-9_-]/g, "_")}`;
 }

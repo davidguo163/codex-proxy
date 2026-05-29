@@ -106,15 +106,16 @@ export function createInternalDeviceRoutes(): Hono {
 
     try {
       const user = await exchangeFeishuCodeForUser(code, feishuConfig);
+      const displayIdentity = user.email ?? user.name ?? user.unionId ?? user.openId ?? "Feishu user";
       if (!isFeishuUserAllowed(user, feishuConfig)) {
-        return c.html(htmlPage(stateResult.userCode, `Feishu user is not allowed: ${escapeHtml(user.email)}`), 403);
+        return c.html(htmlPage(stateResult.userCode, `Feishu user is not allowed: ${escapeHtml(displayIdentity)}`), 403);
       }
       const approved = internalTokenStore.approve(stateResult.userCode, {
-        email: user.email,
+        email: user.email ?? displayIdentity,
         accountId: feishuAccountId(user),
       });
       if (!approved.ok) return c.html(htmlPage(stateResult.userCode, `Approval failed: ${approved.error}`), 400);
-      return c.html(htmlPage(stateResult.userCode, `Approved for ${escapeHtml(user.email)}. Return to minicodex.`));
+      return c.html(htmlPage(stateResult.userCode, `Approved for ${escapeHtml(displayIdentity)}. Return to minicodex.`));
     } catch (err) {
       const message = err instanceof Error ? err.message : "unknown_error";
       return c.html(htmlPage(stateResult.userCode, `Feishu login failed: ${escapeHtml(message)}`), 502);
