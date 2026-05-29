@@ -22,15 +22,16 @@ function isHttps(c: Context): boolean {
 }
 
 /** Paths that are always allowed through without dashboard session. */
-const ALLOWED_PREFIXES = ["/assets/", "/v1/", "/v1beta/", "/official-agent/"];
+const ALLOWED_PREFIXES = ["/assets/", "/v1/", "/openai/v1/", "/v1beta/", "/official-agent/", "/api/codex/", "/api/accounts/deviceauth/"];
 const ALLOWED_EXACT = new Set([
   "/health",
   "/auth/dashboard-login",
   "/auth/dashboard-logout",
   "/auth/dashboard-status",
+  "/oauth/token",
 ]);
 /** GET-only paths allowed (HTML shell must load to render login form). */
-const ALLOWED_GET_EXACT = new Set(["/"]);
+const ALLOWED_GET_EXACT = new Set(["/", "/codex/device"]);
 
 
 export async function dashboardAuth(c: Context, next: Next): Promise<Response | void> {
