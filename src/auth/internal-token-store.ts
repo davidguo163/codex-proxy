@@ -293,6 +293,16 @@ export class InternalTokenStore {
       aud: "codex-proxy-dev",
       exp: Math.floor((now + ACCESS_TTL_MS) / 1000),
       iat: Math.floor(now / 1000),
+      "https://api.openai.com/profile": {
+        email,
+      },
+      "https://api.openai.com/auth": {
+        chatgpt_plan_type: "pro",
+        chatgpt_user_id: accountId,
+        user_id: accountId,
+        chatgpt_account_id: accountId,
+        chatgpt_account_is_fedramp: false,
+      },
     });
     const session: AccessSession = {
       accessToken,
@@ -313,7 +323,7 @@ export class InternalTokenStore {
       expiresAt: Math.floor(session.expiresAtMs / 1000),
       accountId,
       email,
-      tokenEndpoint: `${origin}/api/codex/oauth/token`,
+      tokenEndpoint: `${origin}/oauth/token`,
       apiBaseUrl: `${origin}/openai/v1`,
       issuer: ISSUER,
     };

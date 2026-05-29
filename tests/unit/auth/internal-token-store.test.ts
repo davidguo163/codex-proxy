@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { InternalTokenStore } from "@src/auth/internal-token-store.js";
 
+function decodeJwtPayload(jwt: string): Record<string, unknown> {
+  const payload = jwt.split(".")[1];
+  if (!payload) throw new Error("missing JWT payload");
+  return JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<string, unknown>;
+}
+
 const headers = new Headers({
   host: "easyceo.thelightco.net",
   "x-forwarded-proto": "https",
@@ -30,7 +36,15 @@ describe("InternalTokenStore", () => {
     expect(result.payload.access_token).toMatch(/^itg_access_/);
     expect(result.payload.refresh_token).toMatch(/^itg_refresh_/);
     expect(result.payload.id_token.split(".")).toHaveLength(3);
+    expect(decodeJwtPayload(result.payload.id_token)).toMatchObject({
+      email: "dev@topgamesinc.com",
+      "https://api.openai.com/auth": {
+        chatgpt_plan_type: "pro",
+        chatgpt_account_id: "emp_dev_codex_proxy",
+      },
+    });
     expect(result.payload.apiBaseUrl).toBe("https://easyceo.thelightco.net/openai/v1");
+    expect(result.payload.tokenEndpoint).toBe("https://easyceo.thelightco.net/oauth/token");
     expect(store.validateAccessToken(result.payload.access_token)).toBe(true);
   });
 
@@ -59,6 +73,7 @@ describe("InternalTokenStore", () => {
     expect(tokenResult.ok).toBe(true);
     if (!tokenResult.ok) return;
     expect(tokenResult.payload.access_token).toMatch(/^itg_access_/);
+    expect(tokenResult.payload.tokenEndpoint).toBe("https://easyceo.thelightco.net/oauth/token");
 
     expect(store.exchangeAuthorizationCode(
       codeResult.payload.authorization_code,
