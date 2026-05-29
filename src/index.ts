@@ -48,6 +48,7 @@ import { createRuntimeUpstreamRouter } from "./proxy/upstream-router-bootstrap.j
 import { startOllamaBridge, stopOllamaBridge } from "./ollama/server.js";
 import { createOfficialAgentRoutes } from "./routes/official-agent.js";
 import { createInternalDeviceRoutes } from "./routes/internal-device.js";
+import { createInternalPoolRoutes } from "./routes/internal-pool.js";
 import { installUncaughtErrorHandlers } from "./logs/error-log.js";
 import { awaitServerListening } from "./utils/await-listening.js";
 
@@ -181,6 +182,7 @@ export async function startServer(options?: StartOptions): Promise<ServerHandle>
 
   app.route("/", createDashboardAuthRoutes());
   app.route("/", createInternalDeviceRoutes());
+  app.route("/", createInternalPoolRoutes(accountPool));
   app.route("/", authRoutes);
   app.route("/", accountRoutes);
   app.route("/", apiKeyRoutes);
