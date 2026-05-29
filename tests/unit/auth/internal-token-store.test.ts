@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { InternalTokenStore } from "@src/auth/internal-token-store.js";
+import {
+  InternalTokenStore,
+  INTERNAL_TOKEN_SESSION_LIMITS,
+} from "@src/auth/internal-token-store.js";
 
 function decodeJwtPayload(jwt: string): Record<string, unknown> {
   const payload = jwt.split(".")[1];
@@ -102,6 +105,110 @@ describe("InternalTokenStore", () => {
     if (!refreshResult.ok) return;
     expect(refreshResult.payload.access_token).toMatch(/^itg_access_/);
     expect(restartedStore.validateAccessToken(refreshResult.payload.access_token)).toBe(true);
+  });
+
+  it("invalidates the previous access token when a refresh token is used", () => {
+    const store = new InternalTokenStore();
+    const start = store.start(headers, "127.0.0.1:18080");
+    expect(store.approve(start.userCode)).toEqual({ ok: true });
+    const pollResult = store.poll(start.deviceCode, headers, "127.0.0.1:18080");
+    expect(pollResult.ok).toBe(true);
+    if (!pollResult.ok) return;
+
+    const oldAccessToken = pollResult.payload.access_token;
+    expect(store.validateAccessToken(oldAccessToken)).toBe(true);
+
+    const refreshResult = store.refresh(
+      pollResult.payload.refresh_token,
+      headers,
+      "127.0.0.1:18080",
+    );
+
+    expect(refreshResult.ok).toBe(true);
+    if (!refreshResult.ok) return;
+    expect(refreshResult.payload.access_token).toMatch(/^itg_access_/);
+    expect(refreshResult.payload.access_token).not.toBe(oldAccessToken);
+    expect(refreshResult.payload.refresh_token).toBe(pollResult.payload.refresh_token);
+    expect(store.validateAccessToken(oldAccessToken)).toBe(false);
+    expect(store.validateAccessToken(refreshResult.payload.access_token)).toBe(true);
+  });
+
+  it("keeps one current access token when the same refresh token is reused", () => {
+    const store = new InternalTokenStore();
+    const start = store.start(headers, "127.0.0.1:18080");
+    expect(store.approve(start.userCode)).toEqual({ ok: true });
+    const pollResult = store.poll(start.deviceCode, headers, "127.0.0.1:18080");
+    expect(pollResult.ok).toBe(true);
+    if (!pollResult.ok) return;
+
+    const firstRefresh = store.refresh(
+      pollResult.payload.refresh_token,
+      headers,
+      "127.0.0.1:18080",
+    );
+    expect(firstRefresh.ok).toBe(true);
+    if (!firstRefresh.ok) return;
+
+    const secondRefresh = store.refresh(
+      pollResult.payload.refresh_token,
+      headers,
+      "127.0.0.1:18080",
+    );
+    expect(secondRefresh.ok).toBe(true);
+    if (!secondRefresh.ok) return;
+
+    expect(store.validateAccessToken(pollResult.payload.access_token)).toBe(false);
+    expect(store.validateAccessToken(firstRefresh.payload.access_token)).toBe(false);
+    expect(store.validateAccessToken(secondRefresh.payload.access_token)).toBe(true);
+  });
+
+  it("evicts restored refresh sessions when the refresh session limit is reached", () => {
+    const firstStore = new InternalTokenStore();
+    const refreshTokens: string[] = [];
+    for (let i = 0; i <= INTERNAL_TOKEN_SESSION_LIMITS.maxRefreshSessions; i++) {
+      const start = firstStore.start(headers, "127.0.0.1:18080");
+      expect(firstStore.approve(start.userCode)).toEqual({ ok: true });
+      const pollResult = firstStore.poll(start.deviceCode, headers, "127.0.0.1:18080");
+      expect(pollResult.ok).toBe(true);
+      if (!pollResult.ok) return;
+      refreshTokens.push(pollResult.payload.refresh_token);
+    }
+
+    const restartedStore = new InternalTokenStore();
+    let firstAccessToken = "";
+    let latestAccessToken = "";
+    for (const refreshToken of refreshTokens) {
+      const refreshResult = restartedStore.refresh(
+        refreshToken,
+        headers,
+        "127.0.0.1:18080",
+      );
+      expect(refreshResult.ok).toBe(true);
+      if (!refreshResult.ok) return;
+      firstAccessToken ||= refreshResult.payload.access_token;
+      latestAccessToken = refreshResult.payload.access_token;
+    }
+
+    expect(restartedStore.validateAccessToken(firstAccessToken)).toBe(false);
+    expect(restartedStore.validateAccessToken(latestAccessToken)).toBe(true);
+  });
+
+  it("requires a configured signing secret for internal refresh tokens", () => {
+    const previous = process.env.CODEX_INTERNAL_TOKEN_SECRET;
+    delete process.env.CODEX_INTERNAL_TOKEN_SECRET;
+    const store = new InternalTokenStore();
+    const start = store.start(headers, "127.0.0.1:18080");
+    expect(store.approve(start.userCode)).toEqual({ ok: true });
+
+    expect(() => store.poll(start.deviceCode, headers, "127.0.0.1:18080")).toThrow(
+      "Internal token signing secret is not configured",
+    );
+
+    if (previous === undefined) {
+      delete process.env.CODEX_INTERNAL_TOKEN_SECRET;
+    } else {
+      process.env.CODEX_INTERNAL_TOKEN_SECRET = previous;
+    }
   });
 
   it("uses http URLs for direct local requests without forwarded proto", () => {
