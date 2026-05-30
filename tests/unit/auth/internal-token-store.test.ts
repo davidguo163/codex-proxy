@@ -86,6 +86,19 @@ describe("InternalTokenStore", () => {
     )).toEqual({ ok: false, error: "invalid_grant" });
   });
 
+  it("access tokens survive a store instance restart because they are signed", () => {
+    const firstStore = new InternalTokenStore();
+    const start = firstStore.start(headers, "127.0.0.1:18080");
+    expect(firstStore.approve(start.userCode)).toEqual({ ok: true });
+    const pollResult = firstStore.poll(start.deviceCode, headers, "127.0.0.1:18080");
+    expect(pollResult.ok).toBe(true);
+    if (!pollResult.ok) return;
+
+    const restartedStore = new InternalTokenStore();
+
+    expect(restartedStore.validateAccessToken(pollResult.payload.access_token)).toBe(true);
+  });
+
   it("refresh tokens survive a store instance restart because they are signed", () => {
     const firstStore = new InternalTokenStore();
     const start = firstStore.start(headers, "127.0.0.1:18080");
@@ -107,7 +120,7 @@ describe("InternalTokenStore", () => {
     expect(restartedStore.validateAccessToken(refreshResult.payload.access_token)).toBe(true);
   });
 
-  it("invalidates the previous access token when a refresh token is used", () => {
+  it("keeps the previous signed access token valid until it expires when a refresh token is used", () => {
     const store = new InternalTokenStore();
     const start = store.start(headers, "127.0.0.1:18080");
     expect(store.approve(start.userCode)).toEqual({ ok: true });
@@ -129,11 +142,11 @@ describe("InternalTokenStore", () => {
     expect(refreshResult.payload.access_token).toMatch(/^itg_access_/);
     expect(refreshResult.payload.access_token).not.toBe(oldAccessToken);
     expect(refreshResult.payload.refresh_token).toBe(pollResult.payload.refresh_token);
-    expect(store.validateAccessToken(oldAccessToken)).toBe(false);
+    expect(store.validateAccessToken(oldAccessToken)).toBe(true);
     expect(store.validateAccessToken(refreshResult.payload.access_token)).toBe(true);
   });
 
-  it("keeps one current access token when the same refresh token is reused", () => {
+  it("keeps all signed access tokens valid until expiry when the same refresh token is reused", () => {
     const store = new InternalTokenStore();
     const start = store.start(headers, "127.0.0.1:18080");
     expect(store.approve(start.userCode)).toEqual({ ok: true });
@@ -157,8 +170,8 @@ describe("InternalTokenStore", () => {
     expect(secondRefresh.ok).toBe(true);
     if (!secondRefresh.ok) return;
 
-    expect(store.validateAccessToken(pollResult.payload.access_token)).toBe(false);
-    expect(store.validateAccessToken(firstRefresh.payload.access_token)).toBe(false);
+    expect(store.validateAccessToken(pollResult.payload.access_token)).toBe(true);
+    expect(store.validateAccessToken(firstRefresh.payload.access_token)).toBe(true);
     expect(store.validateAccessToken(secondRefresh.payload.access_token)).toBe(true);
   });
 
@@ -189,7 +202,7 @@ describe("InternalTokenStore", () => {
       latestAccessToken = refreshResult.payload.access_token;
     }
 
-    expect(restartedStore.validateAccessToken(firstAccessToken)).toBe(false);
+    expect(restartedStore.validateAccessToken(firstAccessToken)).toBe(true);
     expect(restartedStore.validateAccessToken(latestAccessToken)).toBe(true);
   });
 
