@@ -85,6 +85,16 @@ interface SignedRefreshPayload {
   jti: string;
 }
 
+interface SignedAccessPayload {
+  typ: "itg_access";
+  email: string;
+  accountId: string;
+  exp: number;
+  iat: number;
+  refreshJti: string;
+  jti: string;
+}
+
 export interface InternalApprovalIdentity {
   email?: string | null;
   accountId?: string | null;
@@ -319,7 +329,9 @@ export class InternalTokenStore {
   validateAccessToken(token: string): boolean {
     this.cleanupExpired();
     const session = this.accessSessions.get(token);
-    return session !== undefined && session.expiresAtMs > Date.now();
+    if (session !== undefined && session.expiresAtMs > Date.now()) return true;
+    const payload = verifySignedToken<SignedAccessPayload>(token.trim(), "itg_access");
+    return !!payload && payload.typ === "itg_access" && payload.exp > Math.floor(Date.now() / 1000);
   }
 
   private issueNewRefreshSession(
@@ -355,13 +367,19 @@ export class InternalTokenStore {
     fallbackHost: string,
     refreshSession: RefreshSession,
   ): InternalAuthPayload {
-    if (refreshSession.currentAccessToken) {
-      this.accessSessions.delete(refreshSession.currentAccessToken);
-    }
     this.evictAccessSessionsIfNeeded();
     const origin = originFromRequest(headers, fallbackHost);
     const now = Date.now();
-    const accessToken = randomToken("itg_access");
+    const accessExp = Math.floor((now + ACCESS_TTL_MS) / 1000);
+    const accessToken = signedToken("itg_access", {
+      typ: "itg_access",
+      email: refreshSession.email,
+      accountId: refreshSession.accountId,
+      exp: accessExp,
+      iat: Math.floor(now / 1000),
+      refreshJti: verifySignedToken<SignedRefreshPayload>(refreshSession.refreshToken, "itg_refresh")?.jti ?? "",
+      jti: randomBytes(16).toString("base64url"),
+    } satisfies SignedAccessPayload);
     const idToken = compactJwt({
       iss: ISSUER,
       sub: refreshSession.accountId,
@@ -384,7 +402,7 @@ export class InternalTokenStore {
       accessToken,
       email: refreshSession.email,
       accountId: refreshSession.accountId,
-      expiresAtMs: now + ACCESS_TTL_MS,
+      expiresAtMs: accessExp * 1000,
     };
     this.accessSessions.set(accessToken, session);
     refreshSession.currentAccessToken = accessToken;
