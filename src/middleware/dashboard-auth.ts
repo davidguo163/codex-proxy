@@ -28,6 +28,7 @@ const ALLOWED_EXACT = new Set([
   "/auth/dashboard-login",
   "/auth/dashboard-logout",
   "/auth/dashboard-status",
+  "/backend-api/wham/apps",
   "/oauth/token",
 ]);
 /** GET-only paths allowed (HTML shell must load to render login form). */

@@ -100,6 +100,12 @@ describe("dashboard-auth middleware", () => {
     expect(res.status).toBe(200);
   });
 
+  it("passes through for Codex Apps MCP endpoint", async () => {
+    const app = createApp();
+    const res = await app.request("/backend-api/wham/apps", { method: "POST" });
+    expect(res.status).toBe(200);
+  });
+
   it("passes through for /v1beta/* API routes", async () => {
     const app = createApp();
     const res = await app.request("/v1beta/models");
