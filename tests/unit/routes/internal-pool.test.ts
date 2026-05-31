@@ -36,6 +36,10 @@ function quotaWithLimits({
   weekly?: boolean;
   codeReview?: boolean;
 }): CodexQuota {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const primaryResetAt = nowSec + 18_000;
+  const weeklyResetAt = nowSec + 604_800;
+  const codeReviewResetAt = nowSec + 18_000;
   return {
     plan_type: "pro",
     rate_limit: {
@@ -43,14 +47,14 @@ function quotaWithLimits({
       limit_reached: primary,
       used_percent: primary ? 100 : 10,
       remaining_percent: primary ? 0 : 90,
-      reset_at: 1780055839,
+      reset_at: primaryResetAt,
       limit_window_seconds: 18000,
     },
     secondary_rate_limit: {
       limit_reached: weekly,
       used_percent: weekly ? 100 : 33,
       remaining_percent: weekly ? 0 : 67,
-      reset_at: 1780566830,
+      reset_at: weeklyResetAt,
       limit_window_seconds: 604800,
     },
     code_review_rate_limit: {
@@ -58,7 +62,7 @@ function quotaWithLimits({
       limit_reached: codeReview,
       used_percent: codeReview ? 100 : 20,
       remaining_percent: codeReview ? 0 : 80,
-      reset_at: 1780060000,
+      reset_at: codeReviewResetAt,
       limit_window_seconds: 18000,
     },
   };
@@ -100,10 +104,11 @@ describe("GET /api/codex/pool/accounts", () => {
 
   it("returns a redacted pool summary with effective quota status", async () => {
     const pool = makePool();
+    const quota = quotaWithLimits({ primary: true });
     const { id, token } = addAccountWithQuota(
       pool,
       "dev@example.com",
-      quotaWithLimits({ primary: true }),
+      quota,
     );
 
     const app = createInternalPoolRoutes(pool);
@@ -128,16 +133,16 @@ describe("GET /api/codex/pool/accounts", () => {
           used_percent: 100,
           remaining_percent: 0,
           limit_reached: true,
-          reset_at: 1780055839,
-          reset_at_iso: "2026-05-29T11:57:19.000Z",
+          reset_at: quota.rate_limit.reset_at,
+          reset_at_iso: new Date(quota.rate_limit.reset_at! * 1000).toISOString(),
           limit_window_seconds: 18000,
         },
         weekly: {
           used_percent: 33,
           remaining_percent: 67,
           limit_reached: false,
-          reset_at: 1780566830,
-          reset_at_iso: "2026-06-04T09:53:50.000Z",
+          reset_at: quota.secondary_rate_limit!.reset_at,
+          reset_at_iso: new Date(quota.secondary_rate_limit!.reset_at! * 1000).toISOString(),
           limit_window_seconds: 604800,
         },
       },

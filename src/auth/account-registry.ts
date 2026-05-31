@@ -6,7 +6,7 @@
  */
 
 import { randomBytes } from "crypto";
-import { readFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import { getConfig } from "../config.js";
 import { internalTokenStore } from "./internal-token-store.js";
@@ -33,6 +33,22 @@ type ResettableQuotaWindow = {
   limit_reached: boolean;
 };
 
+type RefreshField = "token" | "refreshToken" | "status";
+type RefreshFieldProtection = Map<string, Set<RefreshField>>;
+
+const ACCOUNT_FILE_LOCK_STALE_MS = 5 * 60 * 1000;
+const ACCOUNT_FILE_LOCK_WAIT_MS = 5_000;
+const ACCOUNT_FILE_LOCK_POLL_MS = 25;
+
+function isAccountStatus(status: unknown): status is AccountEntry["status"] {
+  return status === "active" ||
+    status === "expired" ||
+    status === "quota_exhausted" ||
+    status === "refreshing" ||
+    status === "disabled" ||
+    status === "banned";
+}
+
 function nextResetAt(resetAt: number, windowSec: number | null | undefined, nowSec: number): number | null {
   if (windowSec == null || windowSec <= 0) return null;
   const elapsedWindows = Math.floor((nowSec - resetAt) / windowSec) + 1;
@@ -49,6 +65,28 @@ function resetExpiredQuotaWindow(
   quotaWindow.limit_reached = false;
   quotaWindow.reset_at = nextResetAt(resetAt, quotaWindow.limit_window_seconds, nowSec);
   return true;
+}
+
+function cloneCachedQuota(quota: CodexQuota | null | undefined): CodexQuota | null {
+  return quota == null
+    ? null
+    : JSON.parse(JSON.stringify(quota)) as CodexQuota;
+}
+
+function cloneAccountEntry(entry: AccountEntry): AccountEntry {
+  return {
+    ...entry,
+    usage: { ...entry.usage },
+    cachedQuota: cloneCachedQuota(entry.cachedQuota),
+  };
+}
+
+function protectFields(entryId: string, fields: RefreshField[]): RefreshFieldProtection {
+  return new Map([[entryId, new Set(fields)]]);
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 export class AccountRegistry {
@@ -90,14 +128,24 @@ export class AccountRegistry {
     for (const existing of this.accounts.values()) {
       if (accountId) {
         if (existing.accountId === accountId && existing.userId === userId) {
-          existing.token = token;
+          const updated = cloneAccountEntry(existing);
+          updated.token = token;
           if (typeof refreshToken === "string" && refreshToken.length > 0) {
-            existing.refreshToken = refreshToken;
+            updated.refreshToken = refreshToken;
           }
-          existing.email = profile?.email ?? existing.email;
-          existing.planType = profile?.chatgpt_plan_type ?? existing.planType;
-          existing.status = isTokenExpired(token) ? "expired" : "active";
-          this.persistNow();
+          updated.email = profile?.email ?? existing.email;
+          updated.planType = profile?.chatgpt_plan_type ?? existing.planType;
+          updated.status = isTokenExpired(token) ? "expired" : "active";
+          const persisted = this.persistEntriesNow(
+            this.entriesWithReplacement(existing.id, updated),
+            protectFields(
+              existing.id,
+              typeof refreshToken === "string" && refreshToken.length > 0
+                ? ["token", "refreshToken", "status"]
+              : ["token", "status"],
+            ),
+          );
+          this.accounts.set(existing.id, persisted.find((item) => item.id === existing.id) ?? updated);
           return existing.id;
         }
       } else if (existing.token === token) {
@@ -136,8 +184,11 @@ export class AccountRegistry {
       quotaFetchedAt: null,
     };
 
-    this.accounts.set(id, entry);
-    this.persistNow();
+    const persisted = this.persistEntriesNow(
+      [...this.accounts.values(), entry],
+      protectFields(id, ["token", "refreshToken", "status"]),
+    );
+    this.accounts.set(id, persisted.find((item) => item.id === id) ?? entry);
     return id;
   }
 
@@ -151,21 +202,31 @@ export class AccountRegistry {
     const entry = this.accounts.get(entryId);
     if (!entry) return;
 
-    entry.token = newToken;
+    const updated = cloneAccountEntry(entry);
+    updated.token = newToken;
     // Never clear an existing RT — only replace with a new non-empty value
     if (typeof refreshToken === "string" && refreshToken.length > 0) {
-      entry.refreshToken = refreshToken;
+      updated.refreshToken = refreshToken;
     }
     const profile = extractUserProfile(newToken);
-    entry.email = profile?.email ?? entry.email;
-    entry.planType = profile?.chatgpt_plan_type ?? entry.planType;
-    entry.accountId = extractChatGptAccountId(newToken) ?? entry.accountId;
-    entry.userId = profile?.chatgpt_user_id ?? entry.userId;
+    updated.email = profile?.email ?? entry.email;
+    updated.planType = profile?.chatgpt_plan_type ?? entry.planType;
+    updated.accountId = extractChatGptAccountId(newToken) ?? entry.accountId;
+    updated.userId = profile?.chatgpt_user_id ?? entry.userId;
     // Don't reactivate manually disabled or banned accounts
-    if (entry.status !== "disabled" && entry.status !== "banned") {
-      entry.status = isTokenExpired(newToken) ? "expired" : "active";
+    if (updated.status !== "disabled" && updated.status !== "banned") {
+      updated.status = isTokenExpired(newToken) ? "expired" : "active";
     }
-    this.persistNow();
+    const persisted = this.persistEntriesNow(
+      this.entriesWithReplacement(entryId, updated),
+      protectFields(
+        entryId,
+        typeof refreshToken === "string" && refreshToken.length > 0
+          ? ["token", "refreshToken", "status"]
+        : ["token", "status"],
+      ),
+    );
+    this.accounts.set(entryId, persisted.find((item) => item.id === entryId) ?? updated);
   }
 
   /**
@@ -173,11 +234,36 @@ export class AccountRegistry {
    * Used to detect cross-process updates before consuming a one-time RT.
    */
   readEntryRTFromDisk(entryId: string): string | null {
+    return this.readEntryRefreshStateFromDisk(entryId)?.refreshToken ?? null;
+  }
+
+  /**
+   * Read the persisted refresh-critical fields for one account from disk.
+   * Used before consuming a one-time RT so live stale processes respect
+   * another process's rotated RT or fail-closed "refreshing" marker.
+   */
+  readEntryRefreshStateFromDisk(entryId: string): {
+    token: string | null;
+    refreshToken: string | null;
+    status: AccountEntry["status"] | null;
+  } | null {
     try {
       const raw = readFileSync(resolve(getDataDir(), "accounts.json"), "utf-8");
-      const data = JSON.parse(raw) as { accounts?: Array<{ id: string; refreshToken?: string | null }> };
+      const data = JSON.parse(raw) as {
+        accounts?: Array<{
+          id: string;
+          token?: string | null;
+          refreshToken?: string | null;
+          status?: AccountEntry["status"] | null;
+        }>;
+      };
       const entry = data.accounts?.find((a) => a.id === entryId);
-      return entry?.refreshToken ?? null;
+      if (!entry) return null;
+      return {
+        token: entry.token ?? null,
+        refreshToken: entry.refreshToken ?? null,
+        status: entry.status ?? null,
+      };
     } catch {
       return null;
     }
@@ -197,8 +283,13 @@ export class AccountRegistry {
   markStatus(entryId: string, status: AccountEntry["status"]): boolean {
     const entry = this.accounts.get(entryId);
     if (!entry) return false;
-    entry.status = status;
-    this.schedulePersist();
+    const updated = cloneAccountEntry(entry);
+    updated.status = status;
+    const persisted = this.persistEntriesNow(
+      this.entriesWithReplacement(entryId, updated),
+      protectFields(entryId, ["status"]),
+    );
+    this.accounts.set(entryId, persisted.find((item) => item.id === entryId) ?? updated);
     return true;
   }
 
@@ -600,8 +691,40 @@ export class AccountRegistry {
     if (this.persistTimer) return;
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
-      this.persistNow();
+      try {
+        this.persistNow();
+      } catch (err) {
+        console.error(
+          "[AccountPool] Scheduled persist failed:",
+          err instanceof Error ? err.message : String(err),
+        );
+      }
     }, 1000);
+  }
+
+  private persistEntriesNow(
+    entries: AccountEntry[],
+    protectedFields: RefreshFieldProtection = new Map(),
+  ): AccountEntry[] {
+    if (this.persistDisabled) return entries;
+    if (!this.persistence.isFileBacked) {
+      this.persistence.save(entries);
+      return entries;
+    }
+
+    const persisted = this.withAccountsFileLock(() => {
+      const merged = this.mergePersistedRefreshState(entries, protectedFields);
+      this.persistence.save(merged);
+      return merged;
+    });
+    this.syncInMemoryRefreshState(persisted, protectedFields);
+    return persisted;
+  }
+
+  private entriesWithReplacement(entryId: string, replacement: AccountEntry): AccountEntry[] {
+    return [...this.accounts.values()].map((entry) =>
+      entry.id === entryId ? replacement : entry,
+    );
   }
 
   persistNow(): void {
@@ -610,7 +733,7 @@ export class AccountRegistry {
       this.persistTimer = null;
     }
     if (this.persistDisabled) return;
-    this.persistence.save([...this.accounts.values()]);
+    this.persistEntriesNow([...this.accounts.values()]);
   }
 
   destroy(): void {
@@ -619,5 +742,145 @@ export class AccountRegistry {
       this.persistTimer = null;
     }
     this.persistNow();
+  }
+
+  private mergePersistedRefreshState(
+    entries: AccountEntry[],
+    protectedFields: RefreshFieldProtection,
+  ): AccountEntry[] {
+    const persisted = this.readPersistedRefreshStatesFromDisk();
+    if (persisted.size === 0) return entries;
+
+    return entries.map((entry) => {
+      const disk = persisted.get(entry.id);
+      if (!disk) return entry;
+      const protectedForEntry = protectedFields.get(entry.id);
+      const merged = cloneAccountEntry(entry);
+      if (!protectedForEntry?.has("token") && typeof disk.token === "string") {
+        merged.token = disk.token;
+      }
+      if (!protectedForEntry?.has("refreshToken") && disk.hasRefreshToken) {
+        merged.refreshToken = disk.refreshToken;
+      }
+      if (
+        disk.status === "refreshing" &&
+        protectedForEntry?.has("status") &&
+        entry.status !== "refreshing" &&
+        !protectedForEntry.has("token") &&
+        !protectedForEntry.has("refreshToken")
+      ) {
+        merged.status = "refreshing";
+      } else if (!protectedForEntry?.has("status") && isAccountStatus(disk.status)) {
+        merged.status = disk.status;
+      }
+      return merged;
+    });
+  }
+
+  private syncInMemoryRefreshState(
+    persisted: AccountEntry[],
+    protectedFields: RefreshFieldProtection,
+  ): void {
+    for (const persistedEntry of persisted) {
+      const memoryEntry = this.accounts.get(persistedEntry.id);
+      if (!memoryEntry) continue;
+      const protectedForEntry = protectedFields.get(persistedEntry.id);
+      if (!protectedForEntry?.has("token")) {
+        memoryEntry.token = persistedEntry.token;
+      }
+      if (!protectedForEntry?.has("refreshToken")) {
+        memoryEntry.refreshToken = persistedEntry.refreshToken;
+      }
+      if (!protectedForEntry?.has("status")) {
+        memoryEntry.status = persistedEntry.status;
+      }
+    }
+  }
+
+  private readPersistedRefreshStatesFromDisk(): Map<string, {
+    token: string | null;
+    refreshToken: string | null;
+    hasRefreshToken: boolean;
+    status: unknown;
+  }> {
+    try {
+      const raw = readFileSync(resolve(getDataDir(), "accounts.json"), "utf-8");
+      const data = JSON.parse(raw) as {
+        accounts?: Array<{
+          id?: unknown;
+          token?: string | null;
+          refreshToken?: string | null;
+          status?: unknown;
+        }>;
+      };
+      const states = new Map<string, {
+        token: string | null;
+        refreshToken: string | null;
+        hasRefreshToken: boolean;
+        status: unknown;
+      }>();
+      for (const entry of data.accounts ?? []) {
+        if (typeof entry.id !== "string") continue;
+        states.set(entry.id, {
+          token: entry.token ?? null,
+          refreshToken: entry.refreshToken ?? null,
+          hasRefreshToken: Object.prototype.hasOwnProperty.call(entry, "refreshToken"),
+          status: entry.status,
+        });
+      }
+      return states;
+    } catch {
+      return new Map();
+    }
+  }
+
+  private withAccountsFileLock<T>(fn: () => T): T {
+    const lockPath = this.accountsFileLockPath();
+    this.acquireAccountsFileLock(lockPath);
+    try {
+      return fn();
+    } finally {
+      try {
+        unlinkSync(lockPath);
+      } catch {
+        // Best-effort cleanup; stale lock handling covers process crashes.
+      }
+    }
+  }
+
+  private accountsFileLockPath(): string {
+    const dir = resolve(getDataDir(), ".locks");
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    return resolve(dir, "accounts-json.lock");
+  }
+
+  private acquireAccountsFileLock(lockPath: string): void {
+    const deadline = Date.now() + ACCOUNT_FILE_LOCK_WAIT_MS;
+    while (true) {
+      try {
+        writeFileSync(lockPath, `${process.pid}\n${Date.now()}`, { flag: "wx" });
+        return;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+          throw err;
+        }
+      }
+
+      try {
+        const content = readFileSync(lockPath, "utf-8");
+        const ts = Number.parseInt(content.split("\n")[1] ?? "", 10);
+        if (Number.isFinite(ts) && Date.now() - ts > ACCOUNT_FILE_LOCK_STALE_MS) {
+          unlinkSync(lockPath);
+          continue;
+        }
+      } catch {
+        // Lock may have disappeared between write attempts; retry below.
+      }
+
+      if (Date.now() >= deadline) {
+        throw new Error("Timed out waiting for accounts.json lock");
+      }
+      sleepSync(ACCOUNT_FILE_LOCK_POLL_MS);
+    }
   }
 }

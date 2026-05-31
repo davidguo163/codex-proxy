@@ -78,8 +78,19 @@ function makePool(count: number) {
   return {
     getAllEntries: () => entries,
     getEntry: (id: string) => entries.find((e) => e.id === id) ?? null,
-    markStatus: vi.fn(),
-    updateToken: vi.fn((_id: string, _token: string, _rt: string) => {}),
+    markStatus: vi.fn((id: string, status: string) => {
+      const entry = entries.find((e) => e.id === id);
+      if (!entry) return false;
+      entry.status = status;
+      return true;
+    }),
+    updateToken: vi.fn((id: string, token: string, rt: string) => {
+      const entry = entries.find((e) => e.id === id);
+      if (!entry) return;
+      entry.token = token;
+      entry.refreshToken = rt;
+      entry.status = "active";
+    }),
   };
 }
 

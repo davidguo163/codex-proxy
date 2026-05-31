@@ -43,8 +43,42 @@ function accountsPath(): string {
   return resolve(tmpData, "accounts.json");
 }
 
+function previousAccountsPath(): string {
+  return resolve(tmpData, "accounts.json.prev");
+}
+
 function corruptBackupFiles(): string[] {
   return readdirSync(tmpData).filter((f) => f.startsWith("accounts.json.corrupt-"));
+}
+
+function accountFile(status = "active"): string {
+  return JSON.stringify({
+    accounts: [
+      {
+        id: "abc",
+        token: "tok",
+        refreshToken: "rt-old",
+        email: null,
+        accountId: null,
+        userId: null,
+        label: null,
+        planType: null,
+        proxyApiKey: "pk",
+        status,
+        usage: {
+          request_count: 0,
+          input_tokens: 0,
+          output_tokens: 0,
+          cached_tokens: 0,
+          empty_response_count: 0,
+          last_used: null,
+        },
+        addedAt: new Date().toISOString(),
+        cachedQuota: null,
+        quotaFetchedAt: null,
+      },
+    ],
+  });
 }
 
 describe("AccountPersistence load failsafe", () => {
@@ -70,33 +104,7 @@ describe("AccountPersistence load failsafe", () => {
   it("valid file with entries → loadFailed=false, entries returned", async () => {
     writeFileSync(
       accountsPath(),
-      JSON.stringify({
-        accounts: [
-          {
-            id: "abc",
-            token: "tok",
-            refreshToken: null,
-            email: null,
-            accountId: null,
-            userId: null,
-            label: null,
-            planType: null,
-            proxyApiKey: "pk",
-            status: "active",
-            usage: {
-              request_count: 0,
-              input_tokens: 0,
-              output_tokens: 0,
-              cached_tokens: 0,
-              empty_response_count: 0,
-              last_used: null,
-            },
-            addedAt: new Date().toISOString(),
-            cachedQuota: null,
-            quotaFetchedAt: null,
-          },
-        ],
-      }),
+      accountFile(),
       "utf-8",
     );
 
@@ -109,7 +117,7 @@ describe("AccountPersistence load failsafe", () => {
     expect(corruptBackupFiles()).toEqual([]);
   });
 
-  it("malformed JSON → loadFailed=true, file quarantined, registry stays empty", async () => {
+  it("malformed JSON without safe previous file → loadFailed=true, file quarantined, registry stays empty", async () => {
     writeFileSync(accountsPath(), "{not valid json", "utf-8");
 
     const { createFsPersistence } = await freshModule();
@@ -132,6 +140,34 @@ describe("AccountPersistence load failsafe", () => {
     const result = createFsPersistence().load();
 
     expect(result.loadFailed).toBe(true);
+    expect(existsSync(accountsPath())).toBe(false);
+    expect(corruptBackupFiles()).toHaveLength(1);
+  });
+
+  it("empty current file + valid safe accounts.json.prev → restores previous accounts", async () => {
+    writeFileSync(accountsPath(), "", "utf-8");
+    writeFileSync(previousAccountsPath(), accountFile("active"), "utf-8");
+
+    const { createFsPersistence } = await freshModule();
+    const result = createFsPersistence().load();
+
+    expect(result.loadFailed).toBeFalsy();
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0].id).toBe("abc");
+    expect(existsSync(accountsPath())).toBe(true);
+    expect(JSON.parse(readFileSync(accountsPath(), "utf-8")).accounts[0].id).toBe("abc");
+    expect(corruptBackupFiles()).toHaveLength(1);
+  });
+
+  it("empty current file + previous file with refreshing account → does not auto-restore stale refresh token", async () => {
+    writeFileSync(accountsPath(), "", "utf-8");
+    writeFileSync(previousAccountsPath(), accountFile("refreshing"), "utf-8");
+
+    const { createFsPersistence } = await freshModule();
+    const result = createFsPersistence().load();
+
+    expect(result.loadFailed).toBe(true);
+    expect(result.entries).toEqual([]);
     expect(existsSync(accountsPath())).toBe(false);
     expect(corruptBackupFiles()).toHaveLength(1);
   });
@@ -188,7 +224,7 @@ describe("AccountPersistence load failsafe", () => {
     // persistence.save() without going through AccountRegistry's
     // persistDisabled gate. The persistence object must refuse and leave
     // the quarantined .bak as the only copy on disk.
-    persistence.save([]);
+    expect(() => persistence.save([])).toThrow("quarantined");
 
     expect(existsSync(accountsPath())).toBe(false);
     expect(corruptBackupFiles()).toHaveLength(1);

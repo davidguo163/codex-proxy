@@ -172,8 +172,9 @@ export class AccountPool {
     this._onExpired = cb;
   }
 
-  markStatus(entryId: string, status: AccountEntry["status"]): void {
-    if (this.registry.markStatus(entryId, status)) {
+  markStatus(entryId: string, status: AccountEntry["status"]): boolean {
+    const changed = this.registry.markStatus(entryId, status);
+    if (changed) {
       this.lifecycle.clearLock(entryId);
       // Status transitions to expired/banned/disabled make the account
       // unusable; reusing a pooled WS would just hit the same wall on the
@@ -183,6 +184,7 @@ export class AccountPool {
     if (status === "expired" && this._onExpired) {
       this._onExpired(entryId);
     }
+    return changed;
   }
 
   /**
@@ -332,6 +334,14 @@ export class AccountPool {
    */
   readEntryRTFromDisk(entryId: string): string | null {
     return this.registry.readEntryRTFromDisk(entryId);
+  }
+
+  readEntryRefreshStateFromDisk(entryId: string): {
+    token: string | null;
+    refreshToken: string | null;
+    status: AccountEntry["status"] | null;
+  } | null {
+    return this.registry.readEntryRefreshStateFromDisk(entryId);
   }
 
   destroy(): void {

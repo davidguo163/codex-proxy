@@ -109,7 +109,9 @@ function makePool(entries: MockEntry[], opts?: { diskRT?: string }) {
     getEntry: (id: string) => entries.find((e) => e.id === id) ?? null,
     markStatus: vi.fn((id: string, status: string) => {
       const e = entries.find((x) => x.id === id);
-      if (e) e.status = status;
+      if (!e) return false;
+      e.status = status;
+      return true;
     }),
     updateToken: vi.fn((id: string, token: string, newRt?: string) => {
       const e = entries.find((x) => x.id === id);
