@@ -4,11 +4,16 @@
  */
 
 import {
+  closeSync,
   readFileSync,
   writeFileSync,
+  openSync,
+  fsyncSync,
   renameSync,
   existsSync,
   mkdirSync,
+  statSync,
+  unlinkSync,
 } from "fs";
 import { resolve, dirname } from "path";
 import { randomBytes } from "crypto";
@@ -20,6 +25,23 @@ import {
   isTokenExpired,
 } from "./jwt-utils.js";
 import type { AccountEntry, AccountsFile, CodexQuota } from "./types.js";
+
+export class AccountPersistenceError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message);
+    this.name = "AccountPersistenceError";
+    if (options && "cause" in options) {
+      (this as Error & { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
+
+class AccountsFileShapeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AccountsFileShapeError";
+  }
+}
 
 /**
  * Migrate a legacy entry to the new schema:
@@ -104,6 +126,8 @@ export interface PersistenceLoadHealth {
 }
 
 export interface AccountPersistence {
+  /** True for the production accounts.json persistence backend. */
+  isFileBacked?: boolean;
   load(): {
     entries: AccountEntry[];
     needsPersist: boolean;
@@ -116,6 +140,9 @@ export interface AccountPersistence {
 
 function getAccountsFile(): string {
   return resolve(getDataDir(), "accounts.json");
+}
+function getPreviousAccountsFile(): string {
+  return getAccountsFile() + ".prev";
 }
 function getLegacyAuthFile(): string {
   return resolve(getDataDir(), "auth.json");
@@ -133,6 +160,8 @@ export function createFsPersistence(): AccountPersistence {
   let quarantineHealth: PersistenceLoadHealth | null = null;
 
   const persistence: AccountPersistence = {
+    isFileBacked: true,
+
     load() {
       // Migrate from legacy auth.json if needed
       const migrated = migrateFromLegacy();
@@ -159,27 +188,107 @@ export function createFsPersistence(): AccountPersistence {
 
     save(accounts: AccountEntry[]): void {
       if (quarantineActive) {
-        console.warn(
+        throw new AccountPersistenceError(
           "[AccountPool] save() refused: accounts.json was quarantined this session" +
             (quarantineHealth?.backupPath ? ` (backup: ${quarantineHealth.backupPath})` : "") +
             ". Restore a healthy file and restart the process to resume auto-save.",
         );
-        return;
       }
       try {
         const accountsFile = getAccountsFile();
         const dir = dirname(accountsFile);
         if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
         const data: AccountsFile = { accounts };
-        const tmpFile = accountsFile + ".tmp";
-        writeFileSync(tmpFile, JSON.stringify(data, null, 2), "utf-8");
-        renameSync(tmpFile, accountsFile);
+        preservePreviousAccountsFile(accountsFile);
+        durableWriteFile(accountsFile, JSON.stringify(data, null, 2));
       } catch (err) {
-        console.error("[AccountPool] Failed to persist accounts:", err instanceof Error ? err.message : err);
+        if (err instanceof AccountPersistenceError) {
+          throw err;
+        }
+        throw new AccountPersistenceError(
+          `Failed to persist accounts: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
+        );
       }
     },
   };
   return persistence;
+}
+
+function durableWriteFile(filePath: string, data: string): void {
+  const tmpFile = filePath + ".tmp";
+  let wroteTmp = false;
+  let renamed = false;
+  try {
+    writeFileSync(tmpFile, data, { encoding: "utf-8", mode: 0o600 });
+    wroteTmp = true;
+    fsyncFile(tmpFile);
+    renameSync(tmpFile, filePath);
+    renamed = true;
+    fsyncDirBestEffortAfterRename(dirname(filePath));
+  } catch (err) {
+    if (wroteTmp && !renamed) {
+      try {
+        unlinkSync(tmpFile);
+      } catch {
+        // Best-effort cleanup only; preserve the original error.
+      }
+    }
+    throw err;
+  }
+}
+
+function fsyncFile(filePath: string): void {
+  const fd = openSync(filePath, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function fsyncDir(dir: string): void {
+  const fd = openSync(dir, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function fsyncDirBestEffortAfterRename(dir: string): void {
+  try {
+    fsyncDir(dir);
+  } catch (err) {
+    if (isUnsupportedDirectoryFsyncError(err)) {
+      console.warn(
+        `[AccountPool] Directory fsync unsupported for ${dir}; accounts file was renamed but parent-directory durability is best-effort on this platform.`,
+      );
+      return;
+    }
+    throw err;
+  }
+}
+
+function isUnsupportedDirectoryFsyncError(err: unknown): boolean {
+  if (process.platform === "win32") return true;
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === "EISDIR" ||
+    code === "EINVAL" ||
+    code === "ENOTSUP" ||
+    code === "EOPNOTSUPP" ||
+    code === "EPERM" ||
+    code === "EACCES";
+}
+
+function preservePreviousAccountsFile(accountsFile: string): void {
+  if (!existsSync(accountsFile)) return;
+  if (statSync(accountsFile).size === 0) return;
+
+  const raw = readFileSync(accountsFile, "utf-8");
+  parseAccountsFile(raw, accountsFile, { allowRefreshing: true });
+
+  durableWriteFile(getPreviousAccountsFile(), raw);
 }
 
 function migrateFromLegacy(): AccountEntry[] {
@@ -235,7 +344,7 @@ function migrateFromLegacy(): AccountEntry[] {
     const dir = dirname(accountsFile);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     const accountsData: AccountsFile = { accounts: [entry] };
-    writeFileSync(accountsFile, JSON.stringify(accountsData, null, 2), "utf-8");
+    durableWriteFile(accountsFile, JSON.stringify(accountsData, null, 2));
 
     // Rename old file
     renameSync(legacyAuthFile, legacyAuthFile + ".bak");
@@ -263,35 +372,61 @@ function loadPersisted(): {
     return quarantineCorruptFile(accountsFile, null, err, "read_failed");
   }
 
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    const data = parseAccountsFile(raw, accountsFile, { allowRefreshing: true });
+    const loaded = loadParsedAccounts(accountsFile, data);
+    if (loaded.loadFailed) {
+      return recoverFromPreviousAccountsFile(loaded as {
+        entries: AccountEntry[];
+        needsPersist: boolean;
+        loadFailed: true;
+        health: PersistenceLoadHealth;
+      });
+    }
+    return loaded;
   } catch (err) {
-    return quarantineCorruptFile(accountsFile, raw, err, "json_parse_failed");
+    const reason = err instanceof AccountsFileShapeError ? "shape_invalid" : "json_parse_failed";
+    const failure = quarantineCorruptFile(accountsFile, raw, err, reason);
+    return recoverFromPreviousAccountsFile(failure);
   }
+}
 
+function parseAccountsFile(
+  raw: string,
+  sourcePath: string,
+  options: { allowRefreshing: boolean },
+): AccountsFile {
+  const parsed = JSON.parse(raw) as unknown;
   // Validate shape BEFORE reading `.accounts` — `null`, primitives, or
   // arrays at the top level would otherwise crash on property access or
   // pass an Array.isArray check on the wrong target.
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return quarantineCorruptFile(
-      accountsFile,
-      raw,
-      new Error(`top-level JSON is not an object (got ${parsed === null ? "null" : Array.isArray(parsed) ? "array" : typeof parsed})`),
-      "shape_invalid",
+    throw new AccountsFileShapeError(
+      `top-level JSON is not an object in ${sourcePath} (got ${parsed === null ? "null" : Array.isArray(parsed) ? "array" : typeof parsed})`,
     );
   }
 
   const data = parsed as AccountsFile;
   if (!Array.isArray(data.accounts)) {
-    return quarantineCorruptFile(
-      accountsFile,
-      raw,
-      new Error("accounts field is not an array"),
-      "shape_invalid",
+    throw new AccountsFileShapeError(`accounts field is not an array in ${sourcePath}`);
+  }
+  if (!options.allowRefreshing && data.accounts.some((entry) => entry.status === "refreshing")) {
+    throw new AccountPersistenceError(
+      `${sourcePath} contains an account left in 'refreshing' state; refusing automatic restore because its refresh token may already have been consumed.`,
     );
   }
+  return data;
+}
 
+function loadParsedAccounts(
+  accountsFile: string,
+  data: AccountsFile,
+): {
+  entries: AccountEntry[];
+  needsPersist: boolean;
+  loadFailed?: boolean;
+  health?: PersistenceLoadHealth;
+} {
   try {
     const entries: AccountEntry[] = [];
     let needsPersist = false;
@@ -374,7 +509,41 @@ function loadPersisted(): {
     return { entries, needsPersist };
   } catch (err) {
     // The per-entry migration/backfill loop threw. Treat as corruption.
-    return quarantineCorruptFile(accountsFile, raw, err, "entry_processing_failed");
+    return quarantineCorruptFile(accountsFile, null, err, "entry_processing_failed");
+  }
+}
+
+function recoverFromPreviousAccountsFile(failure: {
+  entries: AccountEntry[];
+  needsPersist: boolean;
+  loadFailed: true;
+  health: PersistenceLoadHealth;
+}): {
+  entries: AccountEntry[];
+  needsPersist: boolean;
+  loadFailed?: boolean;
+  health?: PersistenceLoadHealth;
+} {
+  const prevFile = getPreviousAccountsFile();
+  if (!existsSync(prevFile)) return failure;
+
+  let raw: string;
+  try {
+    raw = readFileSync(prevFile, "utf-8");
+    const data = parseAccountsFile(raw, prevFile, { allowRefreshing: false });
+    const recovered = loadParsedAccounts(prevFile, data);
+    if (recovered.loadFailed) return failure;
+    durableWriteFile(getAccountsFile(), raw);
+    console.warn(
+      `[AccountPool] Restored accounts.json from safe previous copy ${prevFile} after load failure.`,
+    );
+    return recovered;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(
+      `[AccountPool] Previous accounts copy ${prevFile} was not safe to restore: ${message}`,
+    );
+    return failure;
   }
 }
 

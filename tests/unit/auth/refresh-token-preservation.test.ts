@@ -7,7 +7,9 @@
  *   2. Server returns refresh_token: null (edge case)
  *   3. Server omits refresh_token entirely (edge case)
  *
- * In all cases the persisted RT must be non-null after refresh completes.
+ * In all cases the persisted RT must be non-null. One-time RT responses
+ * without a replacement RT must fail closed in "refreshing" instead of
+ * resuming with a consumed token.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -68,6 +70,11 @@ vi.mock("fs", async () => {
     ...actual,
     readFileSync: vi.fn(() => { throw new Error("ENOENT"); }),
     writeFileSync: vi.fn(),
+    openSync: vi.fn(() => 123),
+    fsyncSync: vi.fn(),
+    closeSync: vi.fn(),
+    statSync: vi.fn(() => ({ size: 100 })),
+    unlinkSync: vi.fn(),
     renameSync: vi.fn(),
     existsSync: vi.fn(() => false),
     mkdirSync: vi.fn(),
@@ -193,7 +200,7 @@ describe("refresh token preservation", () => {
     pool.destroy();
   });
 
-  it("preserves oaistb_rt_ when server returns no new RT", async () => {
+  it("keeps oaistb_rt_ in refreshing state when server returns no replacement RT", async () => {
     const originalRT = "oaistb_rt_one_time_token";
     nextRefreshResponse = {
       access_token: makeFreshJwt(3600),
@@ -218,6 +225,7 @@ describe("refresh token preservation", () => {
 
     const entry = pool.getEntry(entryId);
     expect(entry?.refreshToken).toBe(originalRT);
+    expect(entry?.status).toBe("refreshing");
 
     scheduler.destroy();
     pool.destroy();

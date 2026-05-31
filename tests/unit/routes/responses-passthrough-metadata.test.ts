@@ -39,6 +39,11 @@ vi.mock("fs", async (importOriginal) => {
     ...actual,
     readFileSync: vi.fn(() => "models: []"),
     writeFileSync: vi.fn(),
+    openSync: vi.fn(() => 123),
+    fsyncSync: vi.fn(),
+    closeSync: vi.fn(),
+    statSync: vi.fn(() => ({ size: 100 })),
+    unlinkSync: vi.fn(),
     writeFile: vi.fn(
       (_path: string, _data: string, _encoding: string, cb: (err: Error | null) => void) => cb(null),
     ),

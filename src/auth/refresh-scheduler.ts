@@ -7,7 +7,8 @@
  * - Exponential backoff (5 attempts: 5s → 15s → 45s → 135s → 300s)
  * - Permanent failure detection (invalid_grant / invalid_token)
  * - Recovery scheduling (10 min) for temporary failures
- * - Crash recovery: "refreshing" → immediate retry, "expired" + refreshToken → delayed retry
+ * - Crash recovery: "refreshing" is treated as ambiguous and is not retried automatically,
+ *   "expired" + refreshToken → delayed retry
  */
 
 import { getConfig } from "../config.js";
@@ -15,6 +16,7 @@ import { decodeJwtPayload } from "./jwt-utils.js";
 import { refreshAccessToken } from "./oauth-pkce.js";
 import { jitter, jitterInt } from "../utils/jitter.js";
 import { tryAcquireRefreshLock, releaseRefreshLock } from "./refresh-lock.js";
+import { AccountPersistenceError } from "./account-persistence.js";
 import type { AccountPool } from "./account-pool.js";
 import type { ProxyPool } from "../proxy/proxy-pool.js";
 
@@ -70,9 +72,9 @@ export class RefreshScheduler {
       if (entry.status === "disabled" || entry.status === "banned") continue;
 
       if (entry.status === "refreshing") {
-        // Crash recovery: was mid-refresh when process died
-        console.log(`[RefreshScheduler] Account ${entry.id}: recovering from 'refreshing' state`);
-        this.doRefresh(entry.id);
+        console.error(
+          `[RefreshScheduler] Account ${entry.id}: found persisted 'refreshing' state; not retrying refresh token automatically because it may already have been consumed. Re-login or manual recovery required.`,
+        );
       } else if (entry.status === "expired") {
         // Recovery attempt — stagger by 2s per account to avoid burst
         const delay = 30_000 + expiredIndex * 2_000;
@@ -100,6 +102,7 @@ export class RefreshScheduler {
     const entry = this.pool.getEntry(entryId);
     if (!entry?.refreshToken) return;
     if (entry.status === "disabled" || entry.status === "banned") return;
+    if (entry.status === "refreshing") return;
     if (this._inFlight.has(entryId)) return; // already refreshing
     this.clearOne(entryId);
     this.doRefresh(entryId);
@@ -189,12 +192,14 @@ export class RefreshScheduler {
     try {
       await this._doRefreshInner(entryId);
     } catch (err) {
-      // Unexpected error (e.g. JSON parse failure) — recover from "refreshing" state
+      // Unexpected errors while a one-time refresh token may have been consumed
+      // must fail closed. Re-activating or retrying could reuse the old RT and
+      // invalidate the account's refresh chain.
       const entry = this.pool.getEntry(entryId);
       if (entry?.status === "refreshing") {
-        console.error(`[RefreshScheduler] Unexpected error for ${entryId}: ${err instanceof Error ? err.message : err}`);
-        this.pool.markStatus(entryId, "active");
-        this.scheduleRecovery(entryId);
+        console.error(
+          `[RefreshScheduler] Unexpected error for ${entryId}; leaving account in 'refreshing' state for manual recovery: ${err instanceof Error ? err.message : err}`,
+        );
       }
     } finally {
       this._inFlight.delete(entryId);
@@ -227,32 +232,59 @@ export class RefreshScheduler {
     }
 
     // Cross-process safety: if another process already rotated the RT on disk,
-    // sync from disk instead of consuming the stale in-memory RT.
-    if (this.pool.readEntryRTFromDisk) {
-      const diskRT = this.pool.readEntryRTFromDisk(entryId);
-      if (diskRT && diskRT !== entry.refreshToken) {
+    // sync from disk instead of consuming the stale in-memory RT. If another
+    // process left a fail-closed "refreshing" marker, respect it even when the
+    // RT string is unchanged.
+    const diskState = this.pool.readEntryRefreshStateFromDisk?.(entryId) ??
+      (this.pool.readEntryRTFromDisk
+        ? { token: null, refreshToken: this.pool.readEntryRTFromDisk(entryId), status: null }
+        : null);
+    if (diskState?.status === "refreshing") {
+      console.error(
+        `[RefreshScheduler] Account ${entryId}: disk state is 'refreshing'; not retrying refresh token automatically because it may already have been consumed.`,
+      );
+      return;
+    }
+    if (diskState?.refreshToken) {
+      const diskRT = diskState.refreshToken;
+      if (diskRT !== entry.refreshToken) {
         console.log(`[RefreshScheduler] Account ${entryId}: disk RT differs from memory, syncing`);
-        this.pool.updateToken(entryId, entry.token, diskRT);
+        const token = diskState.token ?? entry.token;
+        this.pool.updateToken(entryId, token, diskRT);
         this.pool.markStatus(entryId, "active");
-        this.scheduleOne(entryId, entry.token);
+        this.scheduleOne(entryId, token);
         return;
       }
     }
 
     console.log(`[RefreshScheduler] Refreshing account ${entryId} (${entry.email ?? "?"})`);
-    this.pool.markStatus(entryId, "refreshing");
+    if (!this.pool.markStatus(entryId, "refreshing")) return;
+    const refreshToken = this.pool.getEntry(entryId)?.refreshToken ?? entry.refreshToken;
+    if (!refreshToken) {
+      console.warn(
+        `[RefreshScheduler] Account ${entryId} lost its refresh_token before refresh. Re-login required at /`,
+      );
+      this.pool.markStatus(entryId, "expired");
+      return;
+    }
 
     const accountProxyUrl = this.proxyPool?.resolveProxyUrl(entryId, true);
+    const isOneTimeRT = refreshToken.startsWith("oaistb_rt_");
     let permanentHits = 0;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
-        const isOneTimeRT = entry.refreshToken.startsWith("oaistb_rt_");
-        const tokens = await refreshAccessToken(entry.refreshToken, accountProxyUrl);
+        const tokens = await refreshAccessToken(refreshToken, accountProxyUrl);
 
         // updateToken guards against clearing RT — safe to pass tokens.refresh_token directly.
         // If the server returned no new RT, the existing one is preserved.
         if (!tokens.refresh_token) {
+          if (isOneTimeRT) {
+            console.error(
+              `[RefreshScheduler] Account ${entryId}: one-time refresh token response did not include a replacement RT. Leaving account in 'refreshing' state for manual recovery.`,
+            );
+            return;
+          }
           console.warn(`[RefreshScheduler] Account ${entryId}: server returned no new RT, keeping existing`);
         }
         this.pool.updateToken(entryId, tokens.access_token, tokens.refresh_token ?? undefined);
@@ -261,7 +293,20 @@ export class RefreshScheduler {
         this.scheduleOne(entryId, tokens.access_token);
         return;
       } catch (err) {
+        if (err instanceof AccountPersistenceError) {
+          console.error(
+            `[RefreshScheduler] Critical persistence failure for ${entryId} after token refresh: ${err.message}. Leaving account in 'refreshing' state; not retrying the old refresh token.`,
+          );
+          return;
+        }
         const msg = err instanceof Error ? err.message : String(err);
+
+        if (isOneTimeRT) {
+          console.error(
+            `[RefreshScheduler] Attempt ${attempt}/${MAX_ATTEMPTS} failed for ${entryId}: ${msg}. Leaving account in 'refreshing' state; not retrying one-time refresh token.`,
+          );
+          return;
+        }
 
         // Track consecutive permanent errors — only mark expired after threshold
         const isPermanent = PERMANENT_ERRORS.some((e) => msg.toLowerCase().includes(e));

@@ -21,6 +21,11 @@ let refreshResult: { access_token: string; refresh_token: string | null } | Erro
   refresh_token: "new_rt",
 };
 
+const refreshLockMock = vi.hoisted(() => ({
+  tryAcquireRefreshLock: vi.fn(() => true),
+  releaseRefreshLock: vi.fn(),
+}));
+
 vi.mock("@src/auth/oauth-pkce.js", () => ({
   refreshAccessToken: vi.fn(async () => {
     if (refreshResult instanceof Error) throw refreshResult;
@@ -28,10 +33,14 @@ vi.mock("@src/auth/oauth-pkce.js", () => ({
   }),
 }));
 
+vi.mock("@src/auth/refresh-lock.js", () => refreshLockMock);
+
 vi.mock("@src/utils/jitter.js", () => ({
   jitter: (val: number) => val,
   jitterInt: (val: number) => val,
 }));
+
+import { refreshAccessToken } from "@src/auth/oauth-pkce.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -74,8 +83,25 @@ function makePool(entries: MockEntry[]) {
   return {
     getEntry: (id: string) => entries.find((e) => e.id === id),
     getAllEntries: () => entries,
-    markStatus: vi.fn(),
-    updateToken: vi.fn(),
+    readEntryRTFromDisk: vi.fn(() => null as string | null),
+    readEntryRefreshStateFromDisk: vi.fn(() => null as {
+      token: string | null;
+      refreshToken: string | null;
+      status: string | null;
+    } | null),
+    markStatus: vi.fn((id: string, status: string) => {
+      const entry = entries.find((e) => e.id === id);
+      if (!entry) return false;
+      entry.status = status;
+      return true;
+    }),
+    updateToken: vi.fn((id: string, token: string, refreshToken?: string) => {
+      const entry = entries.find((e) => e.id === id);
+      if (!entry) return;
+      entry.token = token;
+      if (refreshToken) entry.refreshToken = refreshToken;
+      entry.status = "active";
+    }),
   };
 }
 
@@ -83,6 +109,7 @@ function makeScheduler() {
   return {
     scheduleOne: vi.fn(),
     clearOne: vi.fn(),
+    isRefreshing: vi.fn(() => false),
   };
 }
 
@@ -91,6 +118,8 @@ function makeScheduler() {
 describe("probeAccount", () => {
   beforeEach(() => {
     setConfigForTesting(createMockConfig());
+    vi.clearAllMocks();
+    refreshLockMock.tryAcquireRefreshLock.mockReturnValue(true);
     const validToken = makeValidJwt();
     refreshResult = { access_token: validToken, refresh_token: "new_rt" };
   });
@@ -114,6 +143,128 @@ describe("probeAccount", () => {
     expect(result.durationMs).toBeTypeOf("number");
     expect(pool.updateToken).toHaveBeenCalledOnce();
     expect(scheduler.scheduleOne).toHaveBeenCalledOnce();
+    expect(pool.markStatus.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(refreshAccessToken).mock.invocationCallOrder[0],
+    );
+  });
+
+  it("skips persisted refreshing accounts without consuming the refresh token", async () => {
+    const { probeAccount } = await import("@src/auth/health-check.js");
+    const entries = [makeEntry({ status: "refreshing", refreshToken: "oaistb_rt_old" })];
+    const pool = makePool(entries);
+    const scheduler = makeScheduler();
+
+    const result = await probeAccount(pool as never, scheduler as never, "acc-1");
+
+    expect(result.result).toBe("skipped");
+    expect(result.error).toContain("manual recovery");
+    expect(refreshLockMock.tryAcquireRefreshLock).not.toHaveBeenCalled();
+    expect(refreshAccessToken).not.toHaveBeenCalled();
+  });
+
+  it("skips when the shared refresh lock is already held", async () => {
+    refreshLockMock.tryAcquireRefreshLock.mockReturnValueOnce(false);
+    const { probeAccount } = await import("@src/auth/health-check.js");
+    const entries = [makeEntry()];
+    const pool = makePool(entries);
+    const scheduler = makeScheduler();
+
+    const result = await probeAccount(pool as never, scheduler as never, "acc-1");
+
+    expect(result.result).toBe("skipped");
+    expect(result.error).toBe("refresh already in progress");
+    expect(pool.markStatus).not.toHaveBeenCalled();
+    expect(refreshAccessToken).not.toHaveBeenCalled();
+    expect(refreshLockMock.releaseRefreshLock).not.toHaveBeenCalled();
+  });
+
+  it("does not consume the refresh token when durable refreshing mark fails", async () => {
+    const { probeAccount } = await import("@src/auth/health-check.js");
+    const entries = [makeEntry()];
+    const pool = makePool(entries);
+    pool.markStatus.mockReturnValueOnce(false);
+    const scheduler = makeScheduler();
+
+    const result = await probeAccount(pool as never, scheduler as never, "acc-1");
+
+    expect(result.result).toBe("skipped");
+    expect(result.error).toBe("not found");
+    expect(refreshAccessToken).not.toHaveBeenCalled();
+    expect(refreshLockMock.releaseRefreshLock).toHaveBeenCalledWith("acc-1");
+  });
+
+  it("syncs a cross-process disk refresh-token rotation instead of consuming stale memory RT", async () => {
+    const { probeAccount } = await import("@src/auth/health-check.js");
+    const entries = [makeEntry({ token: "old-token", refreshToken: "oaistb_rt_stale" })];
+    const pool = makePool(entries);
+    pool.readEntryRefreshStateFromDisk.mockReturnValueOnce({
+      token: "fresh-token",
+      refreshToken: "oaistb_rt_fresh",
+      status: "active",
+    });
+    const scheduler = makeScheduler();
+
+    const result = await probeAccount(pool as never, scheduler as never, "acc-1");
+
+    expect(result.result).toBe("alive");
+    expect(pool.markStatus).not.toHaveBeenCalled();
+    expect(refreshAccessToken).not.toHaveBeenCalled();
+    expect(pool.updateToken).toHaveBeenCalledWith("acc-1", "fresh-token", "oaistb_rt_fresh");
+    expect(scheduler.scheduleOne).toHaveBeenCalledWith("acc-1", "fresh-token");
+    expect(refreshLockMock.releaseRefreshLock).toHaveBeenCalledWith("acc-1");
+  });
+
+  it("respects a cross-process disk refreshing marker before persisting local state", async () => {
+    const { probeAccount } = await import("@src/auth/health-check.js");
+    const entries = [makeEntry({ refreshToken: "oaistb_rt_old" })];
+    const pool = makePool(entries);
+    pool.readEntryRefreshStateFromDisk.mockReturnValueOnce({
+      token: "old-token",
+      refreshToken: "oaistb_rt_old",
+      status: "refreshing",
+    });
+    const scheduler = makeScheduler();
+
+    const result = await probeAccount(pool as never, scheduler as never, "acc-1");
+
+    expect(result.result).toBe("skipped");
+    expect(result.error).toContain("manual recovery");
+    expect(pool.markStatus).not.toHaveBeenCalled();
+    expect(refreshAccessToken).not.toHaveBeenCalled();
+    expect(refreshLockMock.releaseRefreshLock).toHaveBeenCalledWith("acc-1");
+  });
+
+  it("keeps one-time RT in refreshing state when refresh succeeds without replacement RT", async () => {
+    refreshResult = { access_token: makeValidJwt(), refresh_token: null };
+    const { probeAccount } = await import("@src/auth/health-check.js");
+    const entries = [makeEntry({ refreshToken: "oaistb_rt_no_replacement" })];
+    const pool = makePool(entries);
+    const scheduler = makeScheduler();
+
+    const result = await probeAccount(pool as never, scheduler as never, "acc-1");
+
+    expect(result.result).toBe("dead");
+    expect(result.error).toContain("replacement refresh token");
+    expect(refreshAccessToken).toHaveBeenCalledOnce();
+    expect(pool.updateToken).not.toHaveBeenCalled();
+    expect(scheduler.scheduleOne).not.toHaveBeenCalled();
+    expect(entries[0].status).toBe("refreshing");
+  });
+
+  it("keeps one-time RT in refreshing state on refresh errors", async () => {
+    refreshResult = new Error("invalid_grant: token already used");
+    const { probeAccount } = await import("@src/auth/health-check.js");
+    const entries = [makeEntry({ refreshToken: "oaistb_rt_reused" })];
+    const pool = makePool(entries);
+    const scheduler = makeScheduler();
+
+    const result = await probeAccount(pool as never, scheduler as never, "acc-1");
+
+    expect(result.result).toBe("dead");
+    expect(result.error).toContain("invalid_grant");
+    expect(pool.markStatus).toHaveBeenCalledWith("acc-1", "refreshing");
+    expect(pool.markStatus).not.toHaveBeenCalledWith("acc-1", "expired");
+    expect(entries[0].status).toBe("refreshing");
   });
 
   it("returns dead and marks expired on permanent error", async () => {
@@ -141,7 +292,10 @@ describe("probeAccount", () => {
 
     expect(result.result).toBe("dead");
     expect(result.error).toContain("ECONNREFUSED");
-    expect(pool.markStatus).not.toHaveBeenCalled();
+    expect(pool.markStatus).toHaveBeenCalledWith("acc-1", "refreshing");
+    expect(pool.markStatus).toHaveBeenCalledWith("acc-1", "active");
+    expect(pool.markStatus).not.toHaveBeenCalledWith("acc-1", "expired");
+    expect(entries[0].status).toBe("active");
   });
 
   it("skips account with no refresh token", async () => {

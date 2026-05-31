@@ -7,7 +7,13 @@ const mockFs = vi.hoisted(() => ({
   readFileSync: vi.fn(() => ""),
   writeFileSync: vi.fn(),
   renameSync: vi.fn(),
+  copyFileSync: vi.fn(),
   mkdirSync: vi.fn(),
+  openSync: vi.fn(() => 123),
+  fsyncSync: vi.fn(),
+  closeSync: vi.fn(),
+  statSync: vi.fn(() => ({ size: 100 })),
+  unlinkSync: vi.fn(),
 }));
 
 vi.mock("fs", () => mockFs);
@@ -23,6 +29,14 @@ vi.mock("@src/auth/jwt-utils.js", () => ({
 }));
 
 import { createFsPersistence } from "@src/auth/account-persistence.js";
+
+function callOrder(mock: { mock: { invocationCallOrder: number[] } }, index: number): number {
+  const order = mock.mock.invocationCallOrder[index];
+  if (order === undefined) {
+    throw new Error(`Missing invocation order at index ${index}`);
+  }
+  return order;
+}
 
 function makeEntry(id: string): AccountEntry {
   return {
@@ -58,6 +72,7 @@ describe("account-persistence", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockFs.existsSync.mockReturnValue(false);
+    mockFs.openSync.mockImplementation(() => 123);
   });
 
   describe("load", () => {
@@ -106,15 +121,16 @@ describe("account-persistence", () => {
       const result = p.load();
       expect(result.entries[0].usage.empty_response_count).toBe(0);
       expect(result.needsPersist).toBe(true);
-      // Verify auto-persist was triggered (write + rename for atomic save)
-      expect(mockFs.writeFileSync).toHaveBeenCalledTimes(1);
-      expect(mockFs.renameSync).toHaveBeenCalledTimes(1);
+      // Verify auto-persist was triggered.
+      expect(mockFs.writeFileSync).toHaveBeenCalled();
+      expect(mockFs.renameSync).toHaveBeenCalled();
     });
   });
 
   describe("save", () => {
-    it("writes atomically via tmp file + rename", () => {
-      mockFs.existsSync.mockReturnValue(true);
+    it("writes durably via tmp file fsync + rename + directory fsync", () => {
+      mockFs.existsSync.mockImplementation(((path: string) =>
+        !path.endsWith("accounts.json") && !path.endsWith("accounts.json.prev")) as () => boolean);
       const p = createFsPersistence();
       const entry = makeEntry("a");
 
@@ -123,7 +139,114 @@ describe("account-persistence", () => {
       expect(mockFs.writeFileSync).toHaveBeenCalledTimes(1);
       const writtenPath = mockFs.writeFileSync.mock.calls[0][0] as string;
       expect(writtenPath).toMatch(/accounts\.json\.tmp$/);
-      expect(mockFs.renameSync).toHaveBeenCalledTimes(1);
+      expect(mockFs.fsyncSync).toHaveBeenCalled();
+      expect(mockFs.renameSync).toHaveBeenCalledWith(
+        expect.stringMatching(/accounts\.json\.tmp$/),
+        expect.stringMatching(/accounts\.json$/),
+      );
+      expect(mockFs.openSync).toHaveBeenCalledWith(
+        expect.stringMatching(/test-persistence$/),
+        "r",
+      );
+
+      const tmpOpenIndex = mockFs.openSync.mock.calls.findIndex(([path]) =>
+        String(path).endsWith("accounts.json.tmp"),
+      );
+      const dirOpenIndex = mockFs.openSync.mock.calls.findIndex(([path]) =>
+        String(path).endsWith("test-persistence"),
+      );
+      expect(tmpOpenIndex).toBeGreaterThanOrEqual(0);
+      expect(dirOpenIndex).toBeGreaterThanOrEqual(0);
+
+      expect(callOrder(mockFs.writeFileSync, 0)).toBeLessThan(callOrder(mockFs.openSync, tmpOpenIndex));
+      expect(callOrder(mockFs.openSync, tmpOpenIndex)).toBeLessThan(callOrder(mockFs.fsyncSync, 0));
+      expect(callOrder(mockFs.fsyncSync, 0)).toBeLessThan(callOrder(mockFs.renameSync, 0));
+      expect(callOrder(mockFs.renameSync, 0)).toBeLessThan(callOrder(mockFs.openSync, dirOpenIndex));
+      expect(callOrder(mockFs.openSync, dirOpenIndex)).toBeLessThan(callOrder(mockFs.fsyncSync, 1));
+    });
+
+    it("preserves previous accounts.json as accounts.json.prev before replacing current", () => {
+      mockFs.existsSync.mockReturnValue(true);
+      mockFs.readFileSync.mockImplementation((path: string) => {
+        if (path.endsWith("accounts.json")) {
+          return JSON.stringify({ accounts: [makeEntry("old")] });
+        }
+        return "";
+      });
+      const p = createFsPersistence();
+
+      p.save([makeEntry("new")]);
+
+      expect(mockFs.writeFileSync).toHaveBeenCalledWith(
+        expect.stringMatching(/accounts\.json\.prev\.tmp$/),
+        expect.stringContaining('"old"'),
+        expect.anything(),
+      );
+      expect(mockFs.renameSync).toHaveBeenCalledWith(
+        expect.stringMatching(/accounts\.json\.prev\.tmp$/),
+        expect.stringMatching(/accounts\.json\.prev$/),
+      );
+
+      const prevTmpOpenIndex = mockFs.openSync.mock.calls.findIndex(([path]) =>
+        String(path).endsWith("accounts.json.prev.tmp"),
+      );
+      const prevDirOpenIndex = mockFs.openSync.mock.calls.findIndex(([_path], index) =>
+        index > prevTmpOpenIndex,
+      );
+      const currentTmpOpenIndex = mockFs.openSync.mock.calls.findIndex(([path]) =>
+        String(path).endsWith("accounts.json.tmp"),
+      );
+      const currentDirOpenIndex = mockFs.openSync.mock.calls.findIndex(([_path], index) =>
+        index > currentTmpOpenIndex,
+      );
+      expect(prevTmpOpenIndex).toBeGreaterThanOrEqual(0);
+      expect(prevDirOpenIndex).toBeGreaterThanOrEqual(0);
+      expect(currentTmpOpenIndex).toBeGreaterThan(prevDirOpenIndex);
+      expect(currentDirOpenIndex).toBeGreaterThan(currentTmpOpenIndex);
+
+      expect(callOrder(mockFs.writeFileSync, 0)).toBeLessThan(callOrder(mockFs.openSync, prevTmpOpenIndex));
+      expect(callOrder(mockFs.openSync, prevTmpOpenIndex)).toBeLessThan(callOrder(mockFs.fsyncSync, 0));
+      expect(callOrder(mockFs.fsyncSync, 0)).toBeLessThan(callOrder(mockFs.renameSync, 0));
+      expect(callOrder(mockFs.renameSync, 0)).toBeLessThan(callOrder(mockFs.openSync, prevDirOpenIndex));
+      expect(callOrder(mockFs.openSync, prevDirOpenIndex)).toBeLessThan(callOrder(mockFs.fsyncSync, 1));
+      expect(callOrder(mockFs.fsyncSync, 1)).toBeLessThan(callOrder(mockFs.writeFileSync, 1));
+      expect(callOrder(mockFs.writeFileSync, 1)).toBeLessThan(callOrder(mockFs.openSync, currentTmpOpenIndex));
+      expect(callOrder(mockFs.openSync, currentTmpOpenIndex)).toBeLessThan(callOrder(mockFs.fsyncSync, 2));
+      expect(callOrder(mockFs.fsyncSync, 2)).toBeLessThan(callOrder(mockFs.renameSync, 1));
+      expect(callOrder(mockFs.renameSync, 1)).toBeLessThan(callOrder(mockFs.openSync, currentDirOpenIndex));
+      expect(callOrder(mockFs.openSync, currentDirOpenIndex)).toBeLessThan(callOrder(mockFs.fsyncSync, 3));
+    });
+
+    it("throws when durable write fails instead of silently continuing", () => {
+      mockFs.existsSync.mockImplementation(((path: string) =>
+        !path.endsWith("accounts.json") && !path.endsWith("accounts.json.prev")) as () => boolean);
+      mockFs.writeFileSync.mockImplementationOnce(() => {
+        throw new Error("disk full");
+      });
+      const p = createFsPersistence();
+
+      expect(() => p.save([makeEntry("a")])).toThrow("Failed to persist accounts");
+    });
+
+    it("does not report failure after rename when directory fsync is unsupported", () => {
+      mockFs.existsSync.mockImplementation(((path: string) =>
+        !path.endsWith("accounts.json") && !path.endsWith("accounts.json.prev")) as () => boolean);
+      mockFs.openSync.mockImplementation((path: string) => {
+        if (path.endsWith("test-persistence")) {
+          const err = new Error("directory fsync unsupported") as NodeJS.ErrnoException;
+          err.code = "EINVAL";
+          throw err;
+        }
+        return 123;
+      });
+      const p = createFsPersistence();
+
+      expect(() => p.save([makeEntry("a")])).not.toThrow();
+      expect(mockFs.renameSync).toHaveBeenCalledWith(
+        expect.stringMatching(/accounts\.json\.tmp$/),
+        expect.stringMatching(/accounts\.json$/),
+      );
+      expect(mockFs.unlinkSync).not.toHaveBeenCalled();
     });
 
     it("creates directory if missing", () => {
@@ -138,7 +261,8 @@ describe("account-persistence", () => {
     });
 
     it("serializes accounts as JSON", () => {
-      mockFs.existsSync.mockReturnValue(true);
+      mockFs.existsSync.mockImplementation(((path: string) =>
+        !path.endsWith("accounts.json") && !path.endsWith("accounts.json.prev")) as () => boolean);
       const p = createFsPersistence();
       const entries = [makeEntry("a"), makeEntry("b")];
       p.save(entries);

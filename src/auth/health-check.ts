@@ -12,6 +12,8 @@
  */
 
 import { refreshAccessToken } from "./oauth-pkce.js";
+import { AccountPersistenceError } from "./account-persistence.js";
+import { tryAcquireRefreshLock, releaseRefreshLock } from "./refresh-lock.js";
 import { jitterInt } from "../utils/jitter.js";
 import type { AccountPool } from "./account-pool.js";
 import type { RefreshScheduler } from "./refresh-scheduler.js";
@@ -69,8 +71,22 @@ export async function probeAccount(
     return { id: entryId, email: entry.email, previousStatus: entry.status, result: "skipped", error: "manually disabled" };
   }
 
+  if (entry.status === "refreshing") {
+    return {
+      id: entryId,
+      email: entry.email,
+      previousStatus: entry.status,
+      result: "skipped",
+      error: "refresh already in progress; manual recovery required",
+    };
+  }
+
   // Skip if scheduler is already refreshing this account — avoid racing for the same one-time RT
   if (scheduler.isRefreshing?.(entryId)) {
+    return { id: entryId, email: entry.email, previousStatus: entry.status, result: "skipped", error: "refresh already in progress" };
+  }
+
+  if (!tryAcquireRefreshLock(entryId)) {
     return { id: entryId, email: entry.email, previousStatus: entry.status, result: "skipped", error: "refresh already in progress" };
   }
 
@@ -79,7 +95,58 @@ export async function probeAccount(
 
   try {
     const accountProxyUrl = proxyPool?.resolveProxyUrl(entryId, true);
-    const tokens = await refreshAccessToken(entry.refreshToken, accountProxyUrl);
+    const diskState = pool.readEntryRefreshStateFromDisk?.(entryId) ??
+      (pool.readEntryRTFromDisk
+        ? { token: null, refreshToken: pool.readEntryRTFromDisk(entryId), status: null }
+        : null);
+    if (diskState?.status === "refreshing") {
+      return {
+        id: entryId,
+        email: entry.email,
+        previousStatus,
+        result: "skipped",
+        error: "refresh already in progress; manual recovery required",
+        durationMs: Date.now() - start,
+      };
+    }
+    const memoryRefreshToken = pool.getEntry(entryId)?.refreshToken ?? entry.refreshToken;
+    if (diskState?.refreshToken && diskState.refreshToken !== memoryRefreshToken) {
+      const token = diskState.token ?? pool.getEntry(entryId)?.token ?? entry.token;
+      pool.updateToken(entryId, token, diskState.refreshToken);
+      scheduler.scheduleOne(entryId, token);
+      return {
+        id: entryId,
+        email: entry.email,
+        previousStatus,
+        result: "alive",
+        durationMs: Date.now() - start,
+      };
+    }
+
+    if (!pool.markStatus(entryId, "refreshing")) {
+      return {
+        id: entryId,
+        email: entry.email,
+        previousStatus,
+        result: "skipped",
+        error: "not found",
+        durationMs: Date.now() - start,
+      };
+    }
+    const refreshToken = pool.getEntry(entryId)?.refreshToken ?? entry.refreshToken;
+
+    const isOneTimeRT = refreshToken.startsWith("oaistb_rt_");
+    const tokens = await refreshAccessToken(refreshToken, accountProxyUrl);
+    if (isOneTimeRT && !tokens.refresh_token) {
+      return {
+        id: entryId,
+        email: entry.email,
+        previousStatus,
+        result: "dead",
+        error: "one-time refresh token response did not include a replacement refresh token",
+        durationMs: Date.now() - start,
+      };
+    }
     pool.updateToken(entryId, tokens.access_token, tokens.refresh_token ?? undefined);
     scheduler.scheduleOne(entryId, tokens.access_token);
 
@@ -92,10 +159,23 @@ export async function probeAccount(
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    if (err instanceof AccountPersistenceError) {
+      return {
+        id: entryId,
+        email: entry.email,
+        previousStatus,
+        result: "dead",
+        error: msg,
+        durationMs: Date.now() - start,
+      };
+    }
     const isPermanent = PERMANENT_ERRORS.some((e) => msg.toLowerCase().includes(e));
+    const isOneTimeRT = entry.refreshToken.startsWith("oaistb_rt_");
 
-    if (isPermanent) {
+    if (isPermanent && !isOneTimeRT) {
       pool.markStatus(entryId, "expired");
+    } else if (!isOneTimeRT) {
+      pool.markStatus(entryId, previousStatus);
     }
 
     return {
@@ -106,6 +186,8 @@ export async function probeAccount(
       error: msg,
       durationMs: Date.now() - start,
     };
+  } finally {
+    releaseRefreshLock(entryId);
   }
 }
 

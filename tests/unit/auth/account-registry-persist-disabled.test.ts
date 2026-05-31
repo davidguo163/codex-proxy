@@ -18,7 +18,43 @@ import { createMemoryPersistence } from "@helpers/account-pool-factory.js";
 import { AccountPool } from "@src/auth/account-pool.js";
 import { AccountRegistry } from "@src/auth/account-registry.js";
 import { createValidJwt } from "@helpers/jwt.js";
-import type { AccountEntry, AccountPersistence } from "@src/auth/account-persistence.js";
+import type { AccountPersistence } from "@src/auth/account-persistence.js";
+import type { AccountEntry } from "@src/auth/types.js";
+
+function makeEntry(overrides: Partial<AccountEntry> = {}): AccountEntry {
+  const token = createValidJwt({ accountId: "acct-a", email: "a@test.com" });
+  return {
+    id: "acc-1",
+    token,
+    refreshToken: "rt-old",
+    email: "a@test.com",
+    accountId: "acct-a",
+    userId: null,
+    label: null,
+    planType: "free",
+    proxyApiKey: "pk",
+    status: "active",
+    usage: {
+      request_count: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cached_tokens: 0,
+      empty_response_count: 0,
+      last_used: null,
+      rate_limit_until: null,
+      window_request_count: 0,
+      window_input_tokens: 0,
+      window_output_tokens: 0,
+      window_cached_tokens: 0,
+      window_counters_reset_at: null,
+      limit_window_seconds: null,
+    },
+    addedAt: new Date().toISOString(),
+    cachedQuota: null,
+    quotaFetchedAt: null,
+    ...overrides,
+  };
+}
 
 describe("AccountRegistry persistDisabled", () => {
   it("schedulePersist is a no-op when persistDisabled=true", () => {
@@ -53,6 +89,38 @@ describe("AccountRegistry persistDisabled", () => {
 
     expect(registry.getEntry(id)).toBeDefined();
     expect(saveSpy).not.toHaveBeenCalled();
+  });
+
+  it("updateToken does not replace in-memory refresh token when durable save fails", () => {
+    const initial = makeEntry({ status: "refreshing" });
+    const persistence = createMemoryPersistence([initial]);
+    vi.spyOn(persistence, "save").mockImplementation(() => {
+      throw new Error("disk full");
+    });
+    const registry = new AccountRegistry(persistence, [initial]);
+    const newToken = createValidJwt({ accountId: "acct-a", email: "new@test.com" });
+
+    expect(() => registry.updateToken(initial.id, newToken, "rt-new")).toThrow("disk full");
+
+    expect(registry.getEntry(initial.id)).toMatchObject({
+      token: initial.token,
+      refreshToken: "rt-old",
+      status: "refreshing",
+      email: "a@test.com",
+    });
+  });
+
+  it("markStatus persists before mutating in-memory status", () => {
+    const initial = makeEntry({ status: "active" });
+    const persistence = createMemoryPersistence([initial]);
+    vi.spyOn(persistence, "save").mockImplementation(() => {
+      throw new Error("disk full");
+    });
+    const registry = new AccountRegistry(persistence, [initial]);
+
+    expect(() => registry.markStatus(initial.id, "refreshing")).toThrow("disk full");
+
+    expect(registry.getEntry(initial.id)?.status).toBe("active");
   });
 });
 

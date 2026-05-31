@@ -7,7 +7,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 vi.mock("@src/config.js", () => ({
   getConfig: vi.fn(() => ({
     auth: {
+      refresh_enabled: true,
       refresh_margin_seconds: 300,
+      refresh_concurrency: 5,
     },
   })),
 }));
@@ -21,6 +23,13 @@ vi.mock("@src/auth/jwt-utils.js", () => ({
 vi.mock("@src/auth/oauth-pkce.js", () => ({
   refreshAccessToken: vi.fn(),
 }));
+
+const refreshLockMock = vi.hoisted(() => ({
+  tryAcquireRefreshLock: vi.fn(() => true),
+  releaseRefreshLock: vi.fn(),
+}));
+
+vi.mock("@src/auth/refresh-lock.js", () => refreshLockMock);
 
 vi.mock("@src/utils/jitter.js", () => ({
   jitter: vi.fn((val: number) => val),
@@ -75,13 +84,20 @@ function createMockPool(entries: Array<{
       };
     }),
     updateToken: vi.fn(),
-    markStatus: vi.fn(),
+    markStatus: vi.fn((id: string, status: string) => {
+      const entry = entries.find((e) => e.id === id);
+      if (!entry) return false;
+      entry.status = status;
+      return true;
+    }),
   } as unknown as AccountPool;
 }
 
 describe("RefreshScheduler", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.clearAllMocks();
+    refreshLockMock.tryAcquireRefreshLock.mockReturnValue(true);
   });
 
   afterEach(() => {
@@ -97,7 +113,7 @@ describe("RefreshScheduler", () => {
     scheduler.destroy();
   });
 
-  it("attempts immediate refresh for 'refreshing' state (crash recovery)", () => {
+  it("does not auto-retry 'refreshing' state after process restart", async () => {
     const pool = createMockPool([
       { id: "acc1", token: "token1", refreshToken: "refresh1", status: "refreshing" },
     ]);
@@ -108,7 +124,109 @@ describe("RefreshScheduler", () => {
     });
 
     const scheduler = new RefreshScheduler(pool);
-    // The doRefresh should be called (async)
+    await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000);
+
+    expect(refreshAccessToken).not.toHaveBeenCalled();
+    scheduler.destroy();
+  });
+
+  it("does not retry a one-time refresh token after the first refresh error", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const entry = { id: "acc1", token: "token1", refreshToken: "oaistb_rt_old", status: "expired" };
+    const pool = {
+      getAllEntries: vi.fn(() => [entry]),
+      getEntry: vi.fn((id: string) => (id === entry.id ? entry : undefined)),
+      markStatus: vi.fn((_id: string, status: string) => {
+        entry.status = status;
+        return true;
+      }),
+      updateToken: vi.fn(),
+      readEntryRTFromDisk: vi.fn(() => entry.refreshToken),
+      readEntryRefreshStateFromDisk: vi.fn(() => ({
+        token: entry.token,
+        refreshToken: entry.refreshToken,
+        status: entry.status,
+      })),
+    } as unknown as AccountPool;
+    vi.mocked(refreshAccessToken).mockRejectedValue(new Error("ECONNRESET"));
+
+    const scheduler = new RefreshScheduler(pool);
+    await vi.advanceTimersByTimeAsync(35_000);
+
+    expect(refreshAccessToken).toHaveBeenCalledTimes(1);
+    expect(entry.status).toBe("refreshing");
+    expect(pool.updateToken).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
+    expect(refreshAccessToken).toHaveBeenCalledTimes(1);
+    scheduler.destroy();
+  });
+
+  it("does not consume a one-time RT when disk state is already refreshing", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const entry = { id: "acc1", token: "token1", refreshToken: "oaistb_rt_old", status: "expired" };
+    const pool = {
+      getAllEntries: vi.fn(() => [entry]),
+      getEntry: vi.fn((id: string) => (id === entry.id ? entry : undefined)),
+      markStatus: vi.fn((_id: string, status: string) => {
+        entry.status = status;
+        return true;
+      }),
+      updateToken: vi.fn(),
+      readEntryRefreshStateFromDisk: vi.fn(() => ({
+        token: entry.token,
+        refreshToken: entry.refreshToken,
+        status: "refreshing",
+      })),
+    } as unknown as AccountPool;
+    vi.mocked(refreshAccessToken).mockResolvedValue({
+      access_token: "new-token",
+      refresh_token: "oaistb_rt_new",
+    });
+
+    const scheduler = new RefreshScheduler(pool);
+    await vi.advanceTimersByTimeAsync(35_000);
+
+    expect(pool.markStatus).not.toHaveBeenCalledWith("acc1", "refreshing");
+    expect(refreshAccessToken).not.toHaveBeenCalled();
+    scheduler.destroy();
+  });
+
+  it("does not schedule success when persisting a rotated refresh token fails", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const entry = { id: "acc1", token: "token1", refreshToken: "oaistb_rt_old", status: "expired" };
+    const { AccountPersistenceError } = await import("@src/auth/account-persistence.js");
+    const pool = {
+      getAllEntries: vi.fn(() => [entry]),
+      getEntry: vi.fn((id: string) => (id === entry.id ? entry : undefined)),
+      markStatus: vi.fn((_id: string, status: string) => {
+        entry.status = status;
+        return true;
+      }),
+      updateToken: vi.fn(() => {
+        throw new AccountPersistenceError("Failed to persist accounts: disk full");
+      }),
+      readEntryRTFromDisk: vi.fn(() => entry.refreshToken),
+      readEntryRefreshStateFromDisk: vi.fn(() => ({
+        token: entry.token,
+        refreshToken: entry.refreshToken,
+        status: entry.status,
+      })),
+    } as unknown as AccountPool;
+    vi.mocked(refreshAccessToken).mockResolvedValue({
+      access_token: "new-token",
+      refresh_token: "oaistb_rt_new",
+    });
+
+    const scheduler = new RefreshScheduler(pool);
+    await vi.advanceTimersByTimeAsync(35_000);
+
+    expect(refreshAccessToken).toHaveBeenCalledTimes(1);
+    expect(pool.updateToken).toHaveBeenCalledOnce();
+    expect(entry.status).toBe("refreshing");
+
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(refreshAccessToken).toHaveBeenCalledTimes(1);
     scheduler.destroy();
   });
 

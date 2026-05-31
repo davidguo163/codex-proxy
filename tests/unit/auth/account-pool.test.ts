@@ -8,6 +8,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 vi.mock("fs", () => ({
   readFileSync: vi.fn(() => { throw new Error("ENOENT"); }),
   writeFileSync: vi.fn(),
+  openSync: vi.fn(() => 123),
+  fsyncSync: vi.fn(),
+  closeSync: vi.fn(),
+  statSync: vi.fn(() => ({ size: 100 })),
+  unlinkSync: vi.fn(),
   renameSync: vi.fn(),
   existsSync: vi.fn(() => false),
   mkdirSync: vi.fn(),
