@@ -26,7 +26,8 @@
     "apply-update": "tsx scripts/build/apply-update.ts",
     "apply-update:dry": "tsx scripts/build/apply-update.ts --dry-run",
     "update": "tsx scripts/build/full-update.ts",
-    "pool-status": "tsx scripts/build/pool-status.ts"
+    "pool-status": "tsx scripts/build/pool-status.ts",
+    "import-openai-device-account": "tsx scripts/build/import-openai-device-account.ts"
   },
   "dependencies": {
     "@electron/asar": "^3.2.0",
