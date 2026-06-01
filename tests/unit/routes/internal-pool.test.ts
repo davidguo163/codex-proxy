@@ -43,14 +43,14 @@ function quotaWithLimits({
       limit_reached: primary,
       used_percent: primary ? 100 : 10,
       remaining_percent: primary ? 0 : 90,
-      reset_at: 1780055839,
+      reset_at: 1880055839,
       limit_window_seconds: 18000,
     },
     secondary_rate_limit: {
       limit_reached: weekly,
       used_percent: weekly ? 100 : 33,
       remaining_percent: weekly ? 0 : 67,
-      reset_at: 1780566830,
+      reset_at: 1880566830,
       limit_window_seconds: 604800,
     },
     code_review_rate_limit: {
@@ -58,7 +58,7 @@ function quotaWithLimits({
       limit_reached: codeReview,
       used_percent: codeReview ? 100 : 20,
       remaining_percent: codeReview ? 0 : 80,
-      reset_at: 1780060000,
+      reset_at: 1880060000,
       limit_window_seconds: 18000,
     },
   };
@@ -98,6 +98,19 @@ describe("GET /api/codex/pool/accounts", () => {
     expect(wrong.status).toBe(401);
   });
 
+  it("does not allow account-level keys to enumerate the full pool", async () => {
+    const pool = makePool();
+    const { id } = addAccountWithQuota(pool, "dev@example.com", quotaWithLimits({}));
+    const accountKey = pool.getEntry(id)?.proxyApiKey;
+    expect(accountKey).toBeTruthy();
+
+    const app = createInternalPoolRoutes(pool);
+    const res = await app.request("/api/codex/pool/accounts", {
+      headers: { Authorization: `Bearer ${accountKey}` },
+    });
+    expect(res.status).toBe(401);
+  });
+
   it("returns a redacted pool summary with effective quota status", async () => {
     const pool = makePool();
     const { id, token } = addAccountWithQuota(
@@ -128,16 +141,16 @@ describe("GET /api/codex/pool/accounts", () => {
           used_percent: 100,
           remaining_percent: 0,
           limit_reached: true,
-          reset_at: 1780055839,
-          reset_at_iso: "2026-05-29T11:57:19.000Z",
+          reset_at: 1880055839,
+          reset_at_iso: "2029-07-29T21:43:59.000Z",
           limit_window_seconds: 18000,
         },
         weekly: {
           used_percent: 33,
           remaining_percent: 67,
           limit_reached: false,
-          reset_at: 1780566830,
-          reset_at_iso: "2026-06-04T09:53:50.000Z",
+          reset_at: 1880566830,
+          reset_at_iso: "2029-08-04T19:40:30.000Z",
           limit_window_seconds: 604800,
         },
       },
@@ -184,5 +197,123 @@ describe("GET /api/codex/pool/accounts", () => {
         }),
       }),
     ]);
+  });
+});
+
+describe("GET /api/codex/usage", () => {
+  beforeEach(() => {
+    mockConfig.server.proxy_api_key = "proxy-secret";
+  });
+
+  it("requires a valid bearer token", async () => {
+    const pool = makePool();
+    addAccountWithQuota(pool, "dev@example.com", quotaWithLimits({}));
+
+    const app = createInternalPoolRoutes(pool);
+    const missing = await app.request("/api/codex/usage");
+    expect(missing.status).toBe(401);
+
+    const wrong = await app.request("/api/codex/usage", {
+      headers: { Authorization: "Bearer wrong" },
+    });
+    expect(wrong.status).toBe(401);
+
+    mockConfig.server.proxy_api_key = null;
+    const invalidInternalToken = await app.request("/api/codex/usage", {
+      headers: { Authorization: "Bearer itg_access_invalid.invalid.invalid" },
+    });
+    expect(invalidInternalToken.status).toBe(401);
+  });
+
+  it("allows account-level keys for client quota lookup", async () => {
+    const pool = makePool();
+    const { id } = addAccountWithQuota(pool, "dev@example.com", quotaWithLimits({}));
+    const accountKey = pool.getEntry(id)?.proxyApiKey;
+    expect(accountKey).toBeTruthy();
+
+    const app = createInternalPoolRoutes(pool);
+    const res = await app.request("/api/codex/usage", {
+      headers: { Authorization: `Bearer ${accountKey}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("returns 503 when no active account has cached quota", async () => {
+    const pool = makePool();
+    pool.addAccount(createValidJwt({
+      accountId: "no-quota-account",
+      userId: "no-quota-user",
+      email: "no-quota@example.com",
+      planType: "pro",
+    }), "refresh-token");
+
+    const app = createInternalPoolRoutes(pool);
+    const res = await app.request("/api/codex/usage", {
+      headers: { Authorization: "Bearer proxy-secret" },
+    });
+    expect(res.status).toBe(503);
+    await expect(res.json()).resolves.toMatchObject({
+      error: "codex_proxy_pool_quota_unavailable",
+    });
+  });
+
+  it("aggregates active cached quota and preserves non-zero compressed capacity", async () => {
+    const pool = makePool();
+    addAccountWithQuota(pool, "one@example.com", {
+      ...quotaWithLimits({}),
+      rate_limit: {
+        ...quotaWithLimits({}).rate_limit,
+        used_percent: 60,
+        remaining_percent: 40,
+        reset_at: 1880055839,
+      },
+      secondary_rate_limit: {
+        ...quotaWithLimits({}).secondary_rate_limit!,
+        used_percent: 90,
+        remaining_percent: 10,
+        reset_at: 1880566830,
+      },
+    });
+    addAccountWithQuota(pool, "two@example.com", {
+      ...quotaWithLimits({}),
+      rate_limit: {
+        ...quotaWithLimits({}).rate_limit,
+        used_percent: 90,
+        remaining_percent: 10,
+        reset_at: 1880055900,
+      },
+      secondary_rate_limit: {
+        ...quotaWithLimits({}).secondary_rate_limit!,
+        used_percent: 80,
+        remaining_percent: 20,
+        reset_at: 1880566900,
+      },
+    });
+
+    const app = createInternalPoolRoutes(pool);
+    const res = await app.request("/api/codex/usage", {
+      headers: { Authorization: "Bearer proxy-secret" },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    expect(body.codex_proxy_pool).toMatchObject({
+      encoding: "displayed_remaining_percent_x100",
+      primary_total_remaining_percent: 50,
+      secondary_total_remaining_percent: 30,
+      primary_account_count: 2,
+      secondary_account_count: 2,
+    });
+    expect(body.rate_limit.primary_window).toMatchObject({
+      used_percent: 99,
+      reset_at: 1880055839,
+      limit_window_seconds: 18000,
+    });
+    expect(body.rate_limit.secondary_window).toMatchObject({
+      used_percent: 99,
+      reset_at: 1880566830,
+      limit_window_seconds: 604800,
+    });
+    expect(body.rate_limit.limit_reached).toBe(false);
   });
 });
