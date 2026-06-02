@@ -298,19 +298,19 @@ describe("GET /api/codex/usage", () => {
     const body = await res.json();
 
     expect(body.codex_proxy_pool).toMatchObject({
-      encoding: "displayed_remaining_percent_x100",
+      encoding: "displayed_remaining_percent_x10",
       primary_total_remaining_percent: 50,
       secondary_total_remaining_percent: 30,
       primary_account_count: 2,
       secondary_account_count: 2,
     });
     expect(body.rate_limit.primary_window).toMatchObject({
-      used_percent: 99,
+      used_percent: 95,
       reset_at: 1880055839,
       limit_window_seconds: 18000,
     });
     expect(body.rate_limit.secondary_window).toMatchObject({
-      used_percent: 99,
+      used_percent: 97,
       reset_at: 1880566830,
       limit_window_seconds: 604800,
     });

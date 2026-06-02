@@ -127,7 +127,7 @@ function aggregateWindow(
 
   if (accountCount === 0) return null;
 
-  const encodedRemaining = clampPercent(totalRemaining / 100);
+  const encodedRemaining = clampPercent(totalRemaining / 10);
   return {
     totalRemaining,
     encodedRemaining,
@@ -182,7 +182,7 @@ function poolUsagePayload(accounts: AccountInfo[]) {
         }
       : null,
     codex_proxy_pool: {
-      encoding: "displayed_remaining_percent_x100",
+      encoding: "displayed_remaining_percent_x10",
       primary_total_remaining_percent: primary?.totalRemaining ?? null,
       secondary_total_remaining_percent: secondary?.totalRemaining ?? null,
       primary_account_count: primary?.accountCount ?? 0,
