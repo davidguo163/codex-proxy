@@ -3,6 +3,7 @@ import { getConfig } from "../config.js";
 import type { AccountPool } from "../auth/account-pool.js";
 import type { AccountInfo, CodexQuotaWindow } from "../auth/types.js";
 import { aggregatePoolWindow } from "../proxy/pool-rate-limit-encoding.js";
+import { internalTokenStore } from "../auth/internal-token-store.js";
 
 type WindowSummary = {
   used_percent: number | null;
@@ -26,6 +27,11 @@ function isAdminAuthorized(authHeader: string | undefined): boolean {
 
 function isClientAuthorized(pool: AccountPool, authHeader: string | undefined): boolean {
   const token = bearerToken(authHeader);
+  try {
+    if (token && internalTokenStore.validateAccessToken(token)) return true;
+  } catch {
+    // Fall through to proxy/account-key validation.
+  }
   try {
     return !!token && pool.validateProxyApiKey(token);
   } catch {

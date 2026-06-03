@@ -88,8 +88,26 @@ vi.mock("@src/routes/shared/proxy-handler.js", () => ({
 // ── Imports ─────────────────────────────────────────────────────────
 
 import { AccountPool } from "@src/auth/account-pool.js";
+import { internalTokenStore } from "@src/auth/internal-token-store.js";
 import { loadStaticModels } from "@src/models/model-store.js";
 import { createResponsesRoutes } from "@src/routes/responses.js";
+
+function internalAccessToken(): string {
+  const headers = new Headers({
+    "x-forwarded-proto": "https",
+    host: "admin.run.ceo",
+  });
+  const started = internalTokenStore.start(headers, "admin.run.ceo");
+  const approved = internalTokenStore.approve(started.userCode, {
+    email: "dev@example.com",
+    accountId: "emp_dev",
+  });
+  expect(approved).toEqual({ ok: true });
+  const polled = internalTokenStore.poll(started.deviceCode, headers, "admin.run.ceo");
+  expect(polled.ok).toBe(true);
+  if (!polled.ok) throw new Error("internal auth polling failed");
+  return polled.payload.access_token;
+}
 
 // ── Tests ───────────────────────────────────────────────────────────
 
@@ -115,6 +133,24 @@ describe("/v1/responses — optional instructions", () => {
     const res = await app.request("/v1/responses", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "codex",
+        input: [{ role: "user", content: "Hello" }],
+        stream: true,
+      }),
+    });
+
+    expect(res.status).toBe(200);
+  });
+
+  it("accepts internal Feishu/device access tokens when proxy key is configured", async () => {
+    mockConfig.server.proxy_api_key = "proxy-secret";
+    const res = await app.request("/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${internalAccessToken()}`,
+      },
       body: JSON.stringify({
         model: "codex",
         input: [{ role: "user", content: "Hello" }],

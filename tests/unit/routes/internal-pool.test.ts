@@ -4,6 +4,7 @@ import { createValidJwt } from "@helpers/jwt.js";
 import { AccountPool } from "@src/auth/account-pool.js";
 import type { CodexQuota } from "@src/auth/types.js";
 import { createInternalPoolRoutes } from "@src/routes/internal-pool.js";
+import { internalTokenStore } from "@src/auth/internal-token-store.js";
 
 const mockConfig = {
   server: { proxy_api_key: "proxy-secret" as string | null },
@@ -78,6 +79,23 @@ function addAccountWithQuota(
   const id = pool.addAccount(token, `${email}-refresh-token-should-not-leak`);
   pool.updateCachedQuota(id, quota);
   return { id, token };
+}
+
+function internalAccessToken(): string {
+  const headers = new Headers({
+    "x-forwarded-proto": "https",
+    host: "admin.run.ceo",
+  });
+  const started = internalTokenStore.start(headers, "admin.run.ceo");
+  const approved = internalTokenStore.approve(started.userCode, {
+    email: "dev@example.com",
+    accountId: "emp_dev",
+  });
+  expect(approved).toEqual({ ok: true });
+  const polled = internalTokenStore.poll(started.deviceCode, headers, "admin.run.ceo");
+  expect(polled.ok).toBe(true);
+  if (!polled.ok) throw new Error("internal auth polling failed");
+  return polled.payload.access_token;
 }
 
 describe("GET /api/codex/pool/accounts", () => {
@@ -234,6 +252,17 @@ describe("GET /api/codex/usage", () => {
     const app = createInternalPoolRoutes(pool);
     const res = await app.request("/api/codex/usage", {
       headers: { Authorization: `Bearer ${accountKey}` },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("allows internal Feishu/device access tokens for client quota lookup", async () => {
+    const pool = makePool();
+    addAccountWithQuota(pool, "dev@example.com", quotaWithLimits({}));
+
+    const app = createInternalPoolRoutes(pool);
+    const res = await app.request("/api/codex/usage", {
+      headers: { Authorization: `Bearer ${internalAccessToken()}` },
     });
     expect(res.status).toBe(200);
   });
