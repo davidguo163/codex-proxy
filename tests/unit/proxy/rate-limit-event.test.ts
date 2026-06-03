@@ -7,6 +7,54 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { parseRateLimitsEvent, type ParsedRateLimit } from "@src/proxy/rate-limit-headers.js";
+import type { AccountInfo, CodexQuota } from "@src/auth/types.js";
+import { rewriteRateLimitsEventForPool } from "@src/proxy/rate-limit-headers.js";
+
+
+function makeQuota(secondaryRemaining: number): CodexQuota {
+  return {
+    plan_type: "pro",
+    rate_limit: {
+      allowed: true,
+      limit_reached: false,
+      used_percent: 0,
+      remaining_percent: 100,
+      reset_at: 1700000000,
+      limit_window_seconds: 18000,
+    },
+    secondary_rate_limit: {
+      limit_reached: false,
+      used_percent: 100 - secondaryRemaining,
+      remaining_percent: secondaryRemaining,
+      reset_at: 1700500000,
+      limit_window_seconds: 604800,
+    },
+    code_review_rate_limit: null,
+  };
+}
+
+function makeAccount(id: string, secondaryRemaining: number): AccountInfo {
+  return {
+    id,
+    email: `${id}@example.com`,
+    accountId: id,
+    userId: id,
+    label: null,
+    planType: "pro",
+    status: "active",
+    usage: {
+      request_count: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      empty_response_count: 0,
+      last_used: null,
+    },
+    addedAt: new Date().toISOString(),
+    expiresAt: null,
+    quota: makeQuota(secondaryRemaining),
+    quotaFetchedAt: new Date().toISOString(),
+  };
+}
 
 describe("parseRateLimitsEvent", () => {
   it("parses a full codex.rate_limits event with primary + secondary", () => {
@@ -262,5 +310,33 @@ describe("ws-transport rate_limits callback", () => {
 
     // Without callback, rate_limits event IS forwarded as SSE (no interception)
     expect(output).toContain("codex.rate_limits");
+  });
+});
+
+
+describe("rewriteRateLimitsEventForPool", () => {
+  it("rewrites official secondary used_percent from pool totals", () => {
+    const rewritten = rewriteRateLimitsEventForPool(
+      {
+        type: "codex.rate_limits",
+        rate_limits: {
+          primary: { used_percent: 10, window_minutes: 300, reset_at: 1700000000 },
+          secondary: { used_percent: 68, window_minutes: 10080, reset_at: 1700500000 },
+        },
+      },
+      [makeAccount("a", 100), makeAccount("b", 96)],
+    );
+
+    expect(rewritten).toMatchObject({
+      type: "codex.rate_limits",
+      rate_limits: {
+        secondary: { used_percent: 80, window_minutes: 10080, reset_at: 1700500000 },
+      },
+      codex_proxy_pool: {
+        encoding: "displayed_remaining_percent_x10",
+        secondary_total_remaining_percent: 196,
+        secondary_account_count: 2,
+      },
+    });
   });
 });

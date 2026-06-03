@@ -19,8 +19,10 @@
 
 import type { CodexInputItem } from "./codex-api.js";
 import type { ParsedRateLimit } from "./rate-limit-headers.js";
+import { rewriteRateLimitsEventForPool } from "./rate-limit-headers.js";
 import { parseRateLimitsEvent } from "./rate-limit-headers.js";
 import { CodexApiError } from "./codex-types.js";
+import type { AccountInfo } from "../auth/types.js";
 import { getProxyUrl } from "../tls/proxy.js";
 import {
   DEFAULT_FIRST_EVENT_TIMEOUT_MS,
@@ -146,6 +148,7 @@ export interface WsPoolContext {
   /** Optional observer fired once with the pool's dispatch decision. Useful
    *  for logging without coupling the caller to the pool's internal state. */
   onDecision?: (decision: WsDispatchDecision) => void;
+  getPoolAccounts?: () => AccountInfo[];
 }
 
 export type WsDispatchDecision =
@@ -263,13 +266,13 @@ export async function createWebSocketResponse(
           wsId: acquired.ws.id,
         });
         try {
-          return await acquired.ws.send({ request, signal, onRateLimits, reused: acquired.reused });
+          return await acquired.ws.send({ request, signal, onRateLimits, reused: acquired.reused, getPoolAccounts: poolCtx.getPoolAccounts });
         } catch (err) {
           if (err instanceof WsReusedConnectionError) {
             // Stale-reuse: open a fresh one-shot WS for this single request.
             // The pool's onDead hook has already evicted the dead entry.
             poolCtx.onDecision?.({ kind: "retry-after-stale-reuse", wsId: acquired.ws.id });
-            return openOneShotWs(wsUrl, headers, request, signal, proxyUrl, onRateLimits);
+            return openOneShotWs(wsUrl, headers, request, signal, proxyUrl, onRateLimits, poolCtx?.getPoolAccounts);
           }
           throw err;
         }
@@ -286,7 +289,7 @@ export async function createWebSocketResponse(
     }
   }
 
-  return openOneShotWs(wsUrl, headers, request, signal, proxyUrl, onRateLimits);
+  return openOneShotWs(wsUrl, headers, request, signal, proxyUrl, onRateLimits, poolCtx?.getPoolAccounts);
 }
 
 async function openOneShotWs(
@@ -296,6 +299,7 @@ async function openOneShotWs(
   signal: AbortSignal | undefined,
   proxyUrl: string | null | undefined,
   onRateLimits: ((rl: ParsedRateLimit) => void) | undefined,
+  getPoolAccounts?: (() => AccountInfo[]) | undefined,
 ): Promise<Response> {
   const WS = await getWS();
   const wsOpts = await buildWsConstructorOpts(WS, headers, proxyUrl);
@@ -436,7 +440,10 @@ async function openOneShotWs(
       if (msg && type === "codex.rate_limits" && onRateLimits) {
         const rl = parseRateLimitsEvent(msg);
         if (rl) onRateLimits(rl);
-        return;
+        const rewritten = getPoolAccounts ? rewriteRateLimitsEventForPool(msg, getPoolAccounts()) : null;
+        if (!rewritten) return;
+        msg = rewritten;
+        type = typeof msg.type === "string" ? msg.type : type;
       }
 
       if (!earlyDecisionMade) {
@@ -456,7 +463,8 @@ async function openOneShotWs(
 
       if (msg) {
         // Re-encode as SSE: event: <type>\ndata: <full json>\n\n
-        const sse = `event: ${type}\ndata: ${raw}\n\n`;
+        const payload = JSON.stringify(msg);
+        const sse = `event: ${type}\ndata: ${payload}\n\n`;
         controller!.enqueue(encoder.encode(sse));
 
         // Close stream after response.completed, response.failed, or error

@@ -48,8 +48,10 @@
  */
 
 import type { ParsedRateLimit } from "./rate-limit-headers.js";
+import { rewriteRateLimitsEventForPool } from "./rate-limit-headers.js";
 import { parseRateLimitsEvent } from "./rate-limit-headers.js";
 import { CodexApiError } from "./codex-types.js";
+import type { AccountInfo } from "../auth/types.js";
 import type { WsCreateRequest } from "./ws-transport.js";
 import { randomUUID } from "crypto";
 
@@ -71,6 +73,7 @@ export class WsReusedConnectionError extends Error {
 interface InFlightSession {
   controller: ReadableStreamDefaultController<Uint8Array>;
   onRateLimits: ((rl: ParsedRateLimit) => void) | undefined;
+  getPoolAccounts?: (() => AccountInfo[]) | undefined;
   earlyDecisionMade: boolean;
   sawTerminalEvent: boolean;
   firstEventTimer: ReturnType<typeof setTimeout> | null;
@@ -302,6 +305,7 @@ export class PersistentWs {
     signal: AbortSignal | undefined;
     onRateLimits: ((rl: ParsedRateLimit) => void) | undefined;
     reused: boolean;
+    getPoolAccounts?: (() => AccountInfo[]) | undefined;
   }): Promise<Response> {
     if (!this.busy) {
       throw new Error("PersistentWs.send called without prior tryAcquire");
@@ -328,6 +332,7 @@ export class PersistentWs {
           this.currentSession = {
             controller,
             onRateLimits: opts.onRateLimits,
+            getPoolAccounts: opts.getPoolAccounts,
             earlyDecisionMade: false,
             sawTerminalEvent: false,
             firstEventTimer: null,
@@ -468,7 +473,10 @@ export class PersistentWs {
     if (msg && type === "codex.rate_limits" && sess.onRateLimits) {
       const rl = parseRateLimitsEvent(msg);
       if (rl) sess.onRateLimits(rl);
-      return;
+      const rewritten = sess.getPoolAccounts ? rewriteRateLimitsEventForPool(msg, sess.getPoolAccounts()) : null;
+      if (!rewritten) return;
+      msg = rewritten;
+      type = typeof msg.type === "string" ? msg.type : type;
     }
 
     if (!sess.earlyDecisionMade) {
@@ -496,7 +504,8 @@ export class PersistentWs {
     }
 
     if (msg) {
-      const sse = `event: ${type}\ndata: ${raw}\n\n`;
+      const payload = JSON.stringify(msg);
+      const sse = `event: ${type}\ndata: ${payload}\n\n`;
       sess.controller.enqueue(this.encoder.encode(sse));
 
       if (isTerminalWsEvent(type)) {

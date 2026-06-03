@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { getConfig } from "../config.js";
 import type { AccountPool } from "../auth/account-pool.js";
 import type { AccountInfo, CodexQuotaWindow } from "../auth/types.js";
+import { aggregatePoolWindow } from "../proxy/pool-rate-limit-encoding.js";
 
 type WindowSummary = {
   used_percent: number | null;
@@ -63,82 +64,7 @@ function quotaEffectiveStatus(account: AccountInfo): string {
   return account.status;
 }
 
-function clampPercent(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  return Math.max(0, Math.min(100, value));
-}
-
-function remainingPercent(window: (CodexQuotaWindow & { limit_reached?: boolean }) | null | undefined): number | null {
-  if (!window) return null;
-  if (window.limit_reached === true) return 0;
-  if (typeof window.used_percent === "number" && Number.isFinite(window.used_percent)) {
-    return clampPercent(100 - window.used_percent);
-  }
-  if (typeof window.remaining_percent === "number" && Number.isFinite(window.remaining_percent)) {
-    return clampPercent(window.remaining_percent);
-  }
-  return null;
-}
-
-function usedPercentFromEncodedRemaining(encodedRemaining: number): number {
-  if (encodedRemaining <= 0) return 100;
-  return Math.min(99, Math.max(0, Math.floor(100 - encodedRemaining)));
-}
-
-type AggregatedWindow = {
-  totalRemaining: number;
-  encodedRemaining: number;
-  usedPercent: number;
-  resetAt: number;
-  limitWindowSeconds: number;
-  accountCount: number;
-};
-
-function aggregateWindow(
-  accounts: AccountInfo[],
-  selectWindow: (account: AccountInfo) => (CodexQuotaWindow & { limit_reached?: boolean }) | null | undefined,
-): AggregatedWindow | null {
-  let totalRemaining = 0;
-  let resetAt: number | null = null;
-  let limitWindowSeconds: number | null = null;
-  let accountCount = 0;
-
-  for (const account of accounts) {
-    if (account.status !== "active") continue;
-    const window = selectWindow(account);
-    const remaining = remainingPercent(window);
-    if (remaining === null) continue;
-
-    totalRemaining += remaining;
-    accountCount++;
-
-    if (typeof window?.reset_at === "number" && Number.isFinite(window.reset_at)) {
-      resetAt = resetAt === null ? window.reset_at : Math.min(resetAt, window.reset_at);
-    }
-    if (
-      typeof window?.limit_window_seconds === "number" &&
-      Number.isFinite(window.limit_window_seconds)
-    ) {
-      limitWindowSeconds = limitWindowSeconds === null
-        ? window.limit_window_seconds
-        : Math.max(limitWindowSeconds, window.limit_window_seconds);
-    }
-  }
-
-  if (accountCount === 0) return null;
-
-  const encodedRemaining = clampPercent(totalRemaining / 10);
-  return {
-    totalRemaining,
-    encodedRemaining,
-    usedPercent: usedPercentFromEncodedRemaining(encodedRemaining),
-    resetAt: Math.round(resetAt ?? (Date.now() / 1000 + 5 * 60 * 60)),
-    limitWindowSeconds: Math.round(limitWindowSeconds ?? 5 * 60 * 60),
-    accountCount,
-  };
-}
-
-function rateLimitWindow(window: AggregatedWindow) {
+function rateLimitWindow(window: ReturnType<typeof aggregatePoolWindow> extends infer T ? Exclude<T, null> : never) {
   return {
     used_percent: window.usedPercent,
     limit_window_seconds: window.limitWindowSeconds,
@@ -148,8 +74,8 @@ function rateLimitWindow(window: AggregatedWindow) {
 }
 
 function poolUsagePayload(accounts: AccountInfo[]) {
-  const primary = aggregateWindow(accounts, (account) => account.quota?.rate_limit);
-  const secondary = aggregateWindow(accounts, (account) => account.quota?.secondary_rate_limit);
+  const primary = aggregatePoolWindow(accounts, (account) => account.quota?.rate_limit);
+  const secondary = aggregatePoolWindow(accounts, (account) => account.quota?.secondary_rate_limit);
   const anyQuotaAccount = accounts.find((account) => account.status === "active" && account.quota);
 
   if (!primary && !secondary) return null;
