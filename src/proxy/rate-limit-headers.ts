@@ -18,7 +18,8 @@
  *   {prefix}-active-limit
  */
 
-import type { CodexQuota, CodexQuotaWindow } from "../auth/types.js";
+import type { AccountInfo, CodexQuota, CodexQuotaWindow } from "../auth/types.js";
+import { aggregatePoolWindow } from "./pool-rate-limit-encoding.js";
 
 export interface ParsedRateLimit {
   primary: {
@@ -234,4 +235,43 @@ function isReviewLimitName(value: string | null): boolean {
     normalized === "code_review" ||
     normalized === "codex_review" ||
     normalized === "codex_code_review";
+}
+
+
+export function rewriteRateLimitsEventForPool(
+  data: unknown,
+  accounts: AccountInfo[],
+): Record<string, unknown> | null {
+  if (!data || typeof data !== "object") return null;
+  const obj = data as Record<string, unknown>;
+  if (obj.type !== "codex.rate_limits") return null;
+
+  const secondary = aggregatePoolWindow(accounts, (account) => account.quota?.secondary_rate_limit);
+  if (!secondary) return { ...obj };
+
+  const rateLimits = (obj.rate_limits && typeof obj.rate_limits === "object")
+    ? { ...(obj.rate_limits as Record<string, unknown>) }
+    : {};
+  const secondaryWindow = (rateLimits.secondary && typeof rateLimits.secondary === "object")
+    ? { ...(rateLimits.secondary as Record<string, unknown>) }
+    : {};
+
+  secondaryWindow.used_percent = secondary.usedPercent;
+  if (secondaryWindow.window_minutes == null && Number.isFinite(secondary.limitWindowSeconds)) {
+    secondaryWindow.window_minutes = Math.round(secondary.limitWindowSeconds / 60);
+  }
+  if (secondaryWindow.reset_at == null) {
+    secondaryWindow.reset_at = secondary.resetAt;
+  }
+  rateLimits.secondary = secondaryWindow;
+
+  return {
+    ...obj,
+    rate_limits: rateLimits,
+    codex_proxy_pool: {
+      encoding: "displayed_remaining_percent_x10",
+      secondary_total_remaining_percent: secondary.totalRemaining,
+      secondary_account_count: secondary.accountCount,
+    },
+  };
 }

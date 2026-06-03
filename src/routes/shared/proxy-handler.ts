@@ -176,6 +176,7 @@ export async function handleProxyRequest(options: HandleProxyRequestOptions): Pr
       variantHash: sessionContext.variantHash,
       requestId,
       tag: fmt.tag,
+      accountPool,
     });
 
   for (;;) {

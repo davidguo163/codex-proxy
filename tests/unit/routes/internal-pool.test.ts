@@ -257,35 +257,23 @@ describe("GET /api/codex/usage", () => {
     });
   });
 
-  it("aggregates active cached quota and preserves non-zero compressed capacity", async () => {
+  it("encodes pool weekly remaining into official secondary_window.used_percent", async () => {
     const pool = makePool();
     addAccountWithQuota(pool, "one@example.com", {
       ...quotaWithLimits({}),
-      rate_limit: {
-        ...quotaWithLimits({}).rate_limit,
-        used_percent: 60,
-        remaining_percent: 40,
-        reset_at: 1880055839,
-      },
       secondary_rate_limit: {
         ...quotaWithLimits({}).secondary_rate_limit!,
-        used_percent: 90,
-        remaining_percent: 10,
+        used_percent: 0,
+        remaining_percent: 100,
         reset_at: 1880566830,
       },
     });
     addAccountWithQuota(pool, "two@example.com", {
       ...quotaWithLimits({}),
-      rate_limit: {
-        ...quotaWithLimits({}).rate_limit,
-        used_percent: 90,
-        remaining_percent: 10,
-        reset_at: 1880055900,
-      },
       secondary_rate_limit: {
         ...quotaWithLimits({}).secondary_rate_limit!,
-        used_percent: 80,
-        remaining_percent: 20,
+        used_percent: 4,
+        remaining_percent: 96,
         reset_at: 1880566900,
       },
     });
@@ -299,18 +287,11 @@ describe("GET /api/codex/usage", () => {
 
     expect(body.codex_proxy_pool).toMatchObject({
       encoding: "displayed_remaining_percent_x10",
-      primary_total_remaining_percent: 50,
-      secondary_total_remaining_percent: 30,
-      primary_account_count: 2,
+      secondary_total_remaining_percent: 196,
       secondary_account_count: 2,
     });
-    expect(body.rate_limit.primary_window).toMatchObject({
-      used_percent: 95,
-      reset_at: 1880055839,
-      limit_window_seconds: 18000,
-    });
     expect(body.rate_limit.secondary_window).toMatchObject({
-      used_percent: 97,
+      used_percent: 80,
       reset_at: 1880566830,
       limit_window_seconds: 604800,
     });

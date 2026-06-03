@@ -1,5 +1,6 @@
 import { getWsPool } from "../../proxy/ws-pool.js";
 import type { WsConnectionPool } from "../../proxy/ws-pool.js";
+import type { AccountPool } from "../../auth/account-pool.js";
 import type { WsPoolContext } from "../../proxy/codex-api.js";
 
 export interface BuildWsPoolContextOptions {
@@ -9,6 +10,7 @@ export interface BuildWsPoolContextOptions {
   variantHash: string;
   requestId: string;
   tag: string;
+  accountPool?: AccountPool;
 }
 
 export interface BuildWsPoolContextDeps {
@@ -35,6 +37,7 @@ export function buildWsPoolContext(
     pool: (deps.getWsPool ?? defaultDeps.getWsPool)(),
     poolKey: `${entryId}:${options.conversationId}:${options.variantHash}`,
     entryId,
+    getPoolAccounts: options.accountPool ? () => options.accountPool!.getAccounts() : undefined,
     onDecision: (decision) => {
       const ridShort = options.requestId.slice(0, 8);
       const wsTag = decision.kind === "bypass"
