@@ -25,6 +25,7 @@ import { CodexApiError } from "./codex-types.js";
 import type { AccountInfo } from "../auth/types.js";
 import { getProxyUrl } from "../tls/proxy.js";
 import {
+  DEFAULT_CONNECT_TIMEOUT_MS,
   DEFAULT_FIRST_EVENT_TIMEOUT_MS,
   DEFAULT_STREAM_IDLE_TIMEOUT_MS,
   PersistentWs,
@@ -209,7 +210,17 @@ async function createPersistentWsConnection(opts: {
       resolve();
       return;
     }
+    const timeout = setTimeout(() => {
+      cleanup();
+      try { ws.close(1000, "connect timeout"); } catch { /* already closing */ }
+      reject(new Error(
+        `WebSocket upstream connect timeout after ${DEFAULT_CONNECT_TIMEOUT_MS}ms` +
+          ` entryId=${opts.entryId} poolKey=${opts.poolKey} wsId=${persistent.id}`,
+      ));
+    }, DEFAULT_CONNECT_TIMEOUT_MS);
+    timeout.unref?.();
     const cleanup = () => {
+      clearTimeout(timeout);
       ws.removeListener("open", onOpen);
       ws.removeListener("error", onErr);
       ws.removeListener("close", onClose);
@@ -320,6 +331,7 @@ async function openOneShotWs(
     // route them through the existing CodexApiError → rotation path.
     let earlyDecisionMade = false;
     let sawTerminalEvent = false;
+    let connectTimer: ReturnType<typeof setTimeout> | null = null;
     let firstEventTimer: ReturnType<typeof setTimeout> | null = null;
     let streamIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -344,6 +356,13 @@ async function openOneShotWs(
       }
     }
 
+    function clearConnectTimer() {
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
+    }
+
     function clearStreamIdleTimer() {
       if (streamIdleTimer) {
         clearTimeout(streamIdleTimer);
@@ -352,6 +371,7 @@ async function openOneShotWs(
     }
 
     function clearTimers() {
+      clearConnectTimer();
       clearFirstEventTimer();
       clearStreamIdleTimer();
     }
@@ -377,6 +397,15 @@ async function openOneShotWs(
       }
     };
     signal?.addEventListener("abort", onAbort, { once: true });
+
+    connectTimer = setTimeout(() => {
+      if (earlyDecisionMade || streamClosed) return;
+      earlyDecisionMade = true;
+      signal?.removeEventListener("abort", onAbort);
+      try { ws.close(1000, "connect timeout"); } catch { /* already closing */ }
+      reject(new Error(`WebSocket upstream connect timeout after ${DEFAULT_CONNECT_TIMEOUT_MS}ms`));
+    }, DEFAULT_CONNECT_TIMEOUT_MS);
+    connectTimer.unref?.();
 
     const stream = new ReadableStream<Uint8Array>({
       start(c) {
@@ -404,6 +433,7 @@ async function openOneShotWs(
     }
 
     ws.on("open", () => {
+      clearConnectTimer();
       ws.send(JSON.stringify(request));
       firstEventTimer = setTimeout(() => {
         if (earlyDecisionMade || streamClosed) return;

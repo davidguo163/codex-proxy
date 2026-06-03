@@ -55,6 +55,7 @@ function makeApi(response: Response): ProxyUpstreamAttemptApi {
 describe("sendProxyUpstreamAttempt", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.useRealTimers();
   });
 
   it("dumps the outbound request, sends it with retry wrapper inputs, and records egress", async () => {
@@ -105,7 +106,8 @@ describe("sendProxyUpstreamAttempt", () => {
     expect(api.createResponse).toHaveBeenCalledTimes(1);
     const createResponseCall = vi.mocked(api.createResponse).mock.calls[0]!;
     expect(createResponseCall[0]).toBe(request.codexRequest);
-    expect(createResponseCall[1]).toBe(abortController.signal);
+    expect(createResponseCall[1]).toBeInstanceOf(AbortSignal);
+    expect(createResponseCall[1]?.aborted).toBe(false);
     expect(createResponseCall[2]).toBeTypeOf("function");
     expect(createResponseCall[3]).toBe(poolCtx);
     expect(recordProxyEgressLog).toHaveBeenCalledWith({
@@ -239,6 +241,51 @@ describe("sendProxyUpstreamAttempt", () => {
     })).rejects.toBe(err);
 
     expect(api.createResponse).toHaveBeenCalledTimes(1);
+    expect(recordProxyEgressLog).not.toHaveBeenCalled();
+  });
+
+  it("hard-times out createResponse, aborts the attempt signal, and logs request identity", async () => {
+    vi.useFakeTimers();
+    const logWarn = vi.fn();
+    let sawAbort = false;
+    const api: ProxyUpstreamAttemptApi = {
+      createResponse: vi.fn((_request, signal) => {
+        signal.addEventListener("abort", () => {
+          sawAbort = true;
+        });
+        return new Promise<Response>(() => { /* hang until hard timeout */ });
+      }),
+    };
+    const poolCtx: WsPoolContext = {
+      pool: new WsConnectionPool({ enabled: false }, { startGc: false }),
+      poolKey: "entry-timeout:conv-1:vh",
+      entryId: "entry-timeout",
+    };
+    const promise = sendProxyUpstreamAttempt({
+      accountPool: makeAccountPool(),
+      api,
+      request: makeProxyRequest(),
+      entryId: "entry-timeout",
+      abortSignal: new AbortController().signal,
+      buildPoolCtx: () => poolCtx,
+      requestId: "request-timeout-123456",
+      tag: "Responses",
+      conversationId: "conv-1",
+      implicitResumeActive: false,
+      resumeReason: null,
+      hardTimeoutMs: 25,
+      logWarn,
+      retryOptions: { maxRetries: 0, baseDelayMs: 1 },
+    });
+    promise.catch(() => { /* test-controlled rejection */ });
+
+    await vi.advanceTimersByTimeAsync(25);
+
+    await expect(promise).rejects.toThrow("hard timeout");
+    expect(sawAbort).toBe(true);
+    expect(logWarn).toHaveBeenCalledWith(expect.stringContaining("rid=request-"));
+    expect(logWarn).toHaveBeenCalledWith(expect.stringContaining("Account entry-timeout"));
+    expect(logWarn).toHaveBeenCalledWith(expect.stringContaining("poolKey=entry-timeout:conv-1:vh"));
     expect(recordProxyEgressLog).not.toHaveBeenCalled();
   });
 });
