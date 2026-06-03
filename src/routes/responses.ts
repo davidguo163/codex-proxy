@@ -40,6 +40,7 @@ import {
   OPENAI_SUBAGENT_HEADER,
   sanitizeClientMetadata,
 } from "../proxy/openai-subagent.js";
+import { internalTokenStore } from "../auth/internal-token-store.js";
 
 const X_CODEX_TURN_STATE_HEADER = "x-codex-turn-state";
 const X_CODEX_TURN_METADATA_HEADER = "x-codex-turn-metadata";
@@ -516,6 +517,19 @@ const PASSTHROUGH_FORMAT: FormatAdapter = {
 
 // ── Shared auth check ─────────────────────────────────────────────
 
+function isValidClientBearerToken(accountPool: AccountPool, token: string): boolean {
+  try {
+    if (accountPool.validateProxyApiKey(token)) return true;
+  } catch {
+    // Fall through to internal-token validation.
+  }
+  try {
+    return internalTokenStore.validateAccessToken(token);
+  } catch {
+    return false;
+  }
+}
+
 function checkAuth(
   c: Context,
   accountPool: AccountPool,
@@ -537,7 +551,8 @@ function checkAuth(
   if (config.server.proxy_api_key) {
     const authHeader = c.req.header("Authorization");
     const providedKey = authHeader?.replace("Bearer ", "");
-    if (!providedKey || !accountPool.validateProxyApiKey(providedKey)) {
+    const validClientToken = !!providedKey && isValidClientBearerToken(accountPool, providedKey);
+    if (!validClientToken) {
       c.status(401);
       return c.json({
         type: "error",
