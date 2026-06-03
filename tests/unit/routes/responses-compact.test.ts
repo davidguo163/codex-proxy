@@ -7,6 +7,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { gzipSync } from "node:zlib";
 import { Hono, type Context } from "hono";
 import type { HandleDirectRequestOptions } from "@src/routes/shared/proxy-handler-types.js";
 
@@ -304,6 +305,25 @@ describe("POST /v1/responses/compact", () => {
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.error.code).toBe("invalid_json");
+  });
+
+  it("decodes gzip compact request bodies before parsing JSON", async () => {
+    const body = {
+      model: "codex",
+      input: [{ role: "user", content: "Hello" }],
+      instructions: "",
+    };
+    const res = await app.request("/v1/responses/compact", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Encoding": "gzip",
+      },
+      body: gzipSync(Buffer.from(JSON.stringify(body), "utf8")),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ output: [{ role: "user", content: "compacted" }] });
   });
 
   it("returns error when upstream fails", async () => {

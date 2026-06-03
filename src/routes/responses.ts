@@ -18,7 +18,12 @@ import { recordStreamCloseEvent } from "../logs/stream-close-event.js";
 import { summarizeRequestForLog } from "../logs/request-summary.js";
 import { getRealClientIp } from "../utils/get-real-client-ip.js";
 import { randomUUID } from "crypto";
-import { zstdDecompressSync } from "node:zlib";
+import {
+  brotliDecompressSync,
+  gunzipSync,
+  inflateSync,
+  zstdDecompressSync,
+} from "node:zlib";
 import type { UpstreamAdapter } from "../proxy/upstream-adapter.js";
 import { getConfig } from "../config.js";
 import { prepareSchema } from "../translation/shared-utils.js";
@@ -595,19 +600,49 @@ function invalidJsonResponse(c: Context): Response {
 }
 
 async function readJsonRequestBody(c: Context): Promise<unknown> {
-  const contentEncoding = c.req.header("content-encoding")?.toLowerCase() ?? "";
-  if (!contentEncoding.split(",").map((part) => part.trim()).includes("zstd")) {
-    return c.req.json();
+  const contentEncodings = (c.req.header("content-encoding")?.toLowerCase() ?? "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (contentEncodings.length === 0) {
+    try {
+      return await c.req.json();
+    } catch (err) {
+      const requestId = c.get("requestId") ?? "unknown";
+      console.warn(
+        `[Responses] invalid JSON body rid=${requestId} path=${c.req.path} content_length=${c.req.header("content-length") ?? "unknown"}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      throw err;
+    }
   }
 
   const requestId = c.get("requestId") ?? "unknown";
-  const encoded = Buffer.from(await c.req.arrayBuffer());
+  let decoded = Buffer.from(await c.req.arrayBuffer());
   try {
-    const decoded = zstdDecompressSync(encoded);
+    for (const encoding of [...contentEncodings].reverse()) {
+      switch (encoding) {
+        case "gzip":
+          decoded = gunzipSync(decoded);
+          break;
+        case "deflate":
+          decoded = inflateSync(decoded);
+          break;
+        case "br":
+          decoded = brotliDecompressSync(decoded);
+          break;
+        case "zstd":
+          decoded = zstdDecompressSync(decoded);
+          break;
+        case "identity":
+          break;
+        default:
+          throw new Error(`unsupported content-encoding: ${encoding}`);
+      }
+    }
     return JSON.parse(decoded.toString("utf8"));
   } catch (err) {
     console.warn(
-      `[Responses] invalid zstd JSON body rid=${requestId} path=${c.req.path} content_length=${c.req.header("content-length") ?? "unknown"} encoded_bytes=${encoded.length}: ${err instanceof Error ? err.message : String(err)}`,
+      `[Responses] invalid encoded JSON body rid=${requestId} path=${c.req.path} content_encoding=${contentEncodings.join(",")} content_length=${c.req.header("content-length") ?? "unknown"} bytes=${decoded.length}: ${err instanceof Error ? err.message : String(err)}`,
     );
     throw err;
   }
