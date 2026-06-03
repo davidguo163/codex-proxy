@@ -5,6 +5,8 @@ import type { AccountPool } from "../auth/account-pool.js";
 import type { CookieJar } from "../proxy/cookie-jar.js";
 import type { ProxyPool } from "../proxy/proxy-pool.js";
 import type { UpstreamRouter } from "../proxy/upstream-router.js";
+import { getConfig } from "../config.js";
+import { internalTokenStore } from "../auth/internal-token-store.js";
 import { createResponsesRoutes } from "./responses.js";
 
 interface BridgeDeps {
@@ -12,18 +14,22 @@ interface BridgeDeps {
   cookieJar?: CookieJar;
   proxyPool?: ProxyPool;
   upstreamRouter?: UpstreamRouter;
+  maxConnectionMs?: number;
 }
 
 export interface ResponsesWsBridgeHandle {
   close: () => Promise<void>;
 }
 
+const DEFAULT_MAX_CONNECTION_MS = 60 * 60 * 1000;
+const SUPPORTED_WS_PATHS = new Set(["/openai/v1/responses", "/v1/responses", "/responses"]);
+
 function sendJson(ws: WebSocket, value: unknown): void {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(value));
 }
 
-function buildError(message: string, code: string, type = "invalid_request_error") {
-  return { type: "error", error: { type, code, message } };
+function buildError(message: string, code: string, type = "invalid_request_error", param?: string) {
+  return { type: "error", error: { type, code, message, ...(param ? { param } : {}) } };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -38,6 +44,29 @@ function rejectUpgrade(socket: Duplex, status: number, message: string): void {
     "\r\n",
   );
   socket.destroy();
+}
+
+function isValidClientBearerToken(accountPool: AccountPool, token: string): boolean {
+  try {
+    if (accountPool.validateProxyApiKey(token)) return true;
+  } catch {
+    // Fall through to internal-token validation.
+  }
+  try {
+    return internalTokenStore.validateAccessToken(token);
+  } catch {
+    return false;
+  }
+}
+
+function isAuthorizedUpgrade(req: IncomingMessage, accountPool: AccountPool): boolean {
+  const config = getConfig();
+  if (!config.server.proxy_api_key) return true;
+  const authHeader = Array.isArray(req.headers.authorization)
+    ? req.headers.authorization[0]
+    : req.headers.authorization;
+  const providedKey = authHeader?.replace("Bearer ", "");
+  return !!providedKey && isValidClientBearerToken(accountPool, providedKey);
 }
 
 function forwardedHeaders(req: IncomingMessage): Headers {
@@ -133,10 +162,11 @@ async function bridgeSingleRequest(
   ws.once("error", abortRequest);
 
   try {
+    const { type: _type, ...requestBody } = payload;
     const request = new Request("http://127.0.0.1/v1/responses", {
       method: "POST",
       headers: forwardedHeaders(req),
-      body: JSON.stringify(payload),
+      body: JSON.stringify(requestBody),
       signal: abortController.signal,
     });
     const response = await app.fetch(request);
@@ -157,33 +187,63 @@ async function bridgeSingleRequest(
   }
 }
 
+function parseWsCreateMessage(raw: WebSocket.RawData): Record<string, unknown> | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.toString());
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed)) return null;
+  return parsed;
+}
+
 function attachWsBridge(wss: WebSocketServer, deps: BridgeDeps): void {
   const responsesApp = createResponsesRoutes(deps.accountPool, deps.cookieJar, deps.proxyPool, deps.upstreamRouter);
   wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
-    let queue = Promise.resolve();
+    let inFlight = false;
+    const maxConnectionMs = deps.maxConnectionMs ?? DEFAULT_MAX_CONNECTION_MS;
+    const lifetimeTimer = maxConnectionMs > 0
+      ? setTimeout(() => {
+          sendJson(ws, buildError(
+            "Connection exceeded maximum duration",
+            "websocket_connection_limit_reached",
+            "invalid_request_error",
+          ));
+          ws.close(1000, "websocket_connection_limit_reached");
+        }, maxConnectionMs)
+      : null;
+    lifetimeTimer?.unref?.();
+
+    ws.once("close", () => {
+      if (lifetimeTimer) clearTimeout(lifetimeTimer);
+    });
 
     ws.on("message", (raw) => {
-      queue = queue.then(async () => {
+      void (async () => {
         if (ws.readyState !== WebSocket.OPEN) return;
-        let payload: Record<string, unknown>;
-        try {
-          payload = JSON.parse(raw.toString()) as Record<string, unknown>;
-        } catch {
+        const payload = parseWsCreateMessage(raw);
+        if (!payload) {
           sendJson(ws, buildError("Malformed JSON websocket request body", "invalid_json"));
           return;
         }
         if (payload.type !== "response.create") {
-          sendJson(ws, buildError("Only response.create is supported", "unsupported_type"));
+          sendJson(ws, buildError("Only response.create is supported", "unsupported_type", "invalid_request_error", "type"));
           return;
         }
-        if (!isRecord(payload)) {
-          sendJson(ws, buildError("Request body must be a JSON object", "invalid_request"));
+        if (inFlight) {
+          sendJson(ws, buildError("a response is already in progress on this connection", "invalid_request"));
           return;
         }
-        await bridgeSingleRequest(ws, payload, req, responsesApp);
-      }).catch((err) => {
+        inFlight = true;
+        try {
+          await bridgeSingleRequest(ws, payload, req, responsesApp);
+        } finally {
+          inFlight = false;
+        }
+      })().catch((err) => {
         const message = err instanceof Error ? err.message : String(err);
-        sendJson(ws, buildError(message, "bridge_queue_error", "server_error"));
+        sendJson(ws, buildError(message, "bridge_error", "server_error"));
       });
     });
   });
@@ -195,8 +255,12 @@ export function installResponsesWsBridge(server: import("http").Server, deps: Br
   const onUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     const host = req.headers.host || "localhost";
     const url = new URL(req.url || "/", `http://${host}`);
-    if (url.pathname !== "/openai/v1/responses") {
+    if (!SUPPORTED_WS_PATHS.has(url.pathname)) {
       rejectUpgrade(socket, 404, "Not Found");
+      return;
+    }
+    if (!isAuthorizedUpgrade(req, deps.accountPool)) {
+      rejectUpgrade(socket, 401, "Unauthorized");
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {

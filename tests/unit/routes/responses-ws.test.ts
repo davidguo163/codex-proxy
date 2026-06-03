@@ -46,12 +46,22 @@ async function startBridge(pool = mockPool()): Promise<{
   server: Server;
   url: string;
   close: () => Promise<void>;
+}>;
+async function startBridge(pool: ReturnType<typeof mockPool>, options: { maxConnectionMs?: number }): Promise<{
+  server: Server;
+  url: string;
+  close: () => Promise<void>;
+}>;
+async function startBridge(pool = mockPool(), options: { maxConnectionMs?: number } = {}): Promise<{
+  server: Server;
+  url: string;
+  close: () => Promise<void>;
 }> {
   const server = createServer((_req, res) => {
     res.statusCode = 200;
     res.end("ok");
   });
-  const bridge = installResponsesWsBridge(server, { accountPool: pool });
+  const bridge = installResponsesWsBridge(server, { accountPool: pool, ...options });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
@@ -189,6 +199,19 @@ describe("responses websocket bridge", () => {
     }
   });
 
+  it("accepts the standard /v1/responses websocket path", async () => {
+    const bridge = await startBridge();
+    try {
+      const ws = new WebSocket(`${bridge.url}/v1/responses`, {
+        headers: { Authorization: "Bearer proxy-secret" },
+      });
+      await waitForOpen(ws);
+      ws.close();
+    } finally {
+      await bridge.close();
+    }
+  });
+
   it("can be installed again after the first server closes", async () => {
     const first = await startBridge();
     await first.close();
@@ -241,39 +264,32 @@ describe("responses websocket bridge", () => {
           previous_response_id: "resp_previous",
         },
       });
+      expect(JSON.stringify(options.req)).not.toContain("response.create");
       ws.close();
     } finally {
       await bridge.close();
     }
   });
 
-  it("serializes websocket messages while forwarding the shared handler stream", async () => {
+  it("rejects a second response.create while one response is in progress", async () => {
     let releaseFirstResponse!: () => void;
-    let firstReleased = false;
     const firstResponseCanFinish = new Promise<void>((resolve) => {
-      releaseFirstResponse = () => {
-        firstReleased = true;
-        resolve();
-      };
+      releaseFirstResponse = resolve;
     });
-    handleProxyRequestMock.mockImplementation(async () => {
-      const callNumber = handleProxyRequestMock.mock.calls.length;
-      if (callNumber === 1) {
-        const stream = new ReadableStream({
-          async start(controller) {
-            controller.enqueue(new TextEncoder().encode(
-              `event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: "resp_1" } })}\n\n`,
-            ));
-            await firstResponseCanFinish;
-            controller.enqueue(new TextEncoder().encode(
-              `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1" } })}\n\n`,
-            ));
-            controller.close();
-          },
-        });
-        return new Response(stream, { headers: { "content-type": "text/event-stream" } });
-      }
-      return sseResponse([{ type: "response.completed", response: { id: "resp_2" } }]);
+    handleProxyRequestMock.mockImplementationOnce(async () => {
+      const stream = new ReadableStream({
+        async start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            `event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: "resp_1" } })}\n\n`,
+          ));
+          await firstResponseCanFinish;
+          controller.enqueue(new TextEncoder().encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1" } })}\n\n`,
+          ));
+          controller.close();
+        },
+      });
+      return new Response(stream, { headers: { "content-type": "text/event-stream" } });
     });
 
     const bridge = await startBridge();
@@ -283,7 +299,7 @@ describe("responses websocket bridge", () => {
       });
       await waitForOpen(ws);
       const firstCreated = waitForMessages(ws, (message) => message.type === "response.created", 1);
-      const completions = waitForMessages(ws, (message) => message.type === "response.completed", 2);
+      const completions = waitForMessages(ws, (message) => message.type === "response.completed", 1);
 
       ws.send(JSON.stringify({
         type: "response.create",
@@ -293,25 +309,150 @@ describe("responses websocket bridge", () => {
       await expect(firstCreated).resolves.toHaveLength(1);
       expect(handleProxyRequestMock).toHaveBeenCalledTimes(1);
 
+      const busyError = waitForMessages(ws, (message) => message.type === "error", 1);
       ws.send(JSON.stringify({
         type: "response.create",
         model: "gpt-5.3-codex",
         previous_response_id: "resp_1",
         input: [{ type: "function_call_output", call_id: "call_1", output: "tool ok" }],
       }));
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      await expect(busyError).resolves.toEqual([
+        expect.objectContaining({
+          error: expect.objectContaining({
+            code: "invalid_request",
+            message: "a response is already in progress on this connection",
+          }),
+        }),
+      ]);
       expect(handleProxyRequestMock).toHaveBeenCalledTimes(1);
-      expect(firstReleased).toBe(false);
 
       releaseFirstResponse();
-      await expect(completions).resolves.toHaveLength(2);
-      expect(handleProxyRequestMock).toHaveBeenCalledTimes(2);
-      expect(handleProxyRequestMock.mock.calls[1]![0].req.codexRequest).toMatchObject({
+      await expect(completions).resolves.toHaveLength(1);
+      ws.close();
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it("supports sequential previous_response_id turns on one websocket", async () => {
+    handleProxyRequestMock.mockImplementationOnce(async () => sseResponse([
+      { type: "response.created", response: { id: "resp_1" } },
+      { type: "response.completed", response: { id: "resp_1" } },
+    ]));
+    handleProxyRequestMock.mockImplementationOnce(async () => sseResponse([
+      { type: "response.created", response: { id: "resp_2" } },
+      { type: "response.completed", response: { id: "resp_2" } },
+    ]));
+
+    const bridge = await startBridge();
+    try {
+      const ws = new WebSocket(`${bridge.url}/openai/v1/responses`, {
+        headers: { Authorization: "Bearer proxy-secret" },
+      });
+      await waitForOpen(ws);
+
+      ws.send(JSON.stringify({
+        type: "response.create",
+        model: "gpt-5.3-codex",
+        input: [{ role: "user", content: [{ type: "input_text", text: "hello" }] }],
+      }));
+      await waitForMessages(ws, (message) => message.type === "response.completed", 1);
+
+      ws.send(JSON.stringify({
+        type: "response.create",
+        model: "gpt-5.3-codex",
         previous_response_id: "resp_1",
-        useWebSocket: true,
+        input: [{ role: "user", content: [{ type: "input_text", text: "continue" }] }],
+      }));
+      await waitForMessages(ws, (message) => message.type === "response.completed", 1);
+
+      expect(handleProxyRequestMock).toHaveBeenCalledTimes(2);
+      expect(handleProxyRequestMock.mock.calls[1]![0].req).toMatchObject({
+        requirePreviousResponseAccount: true,
+        codexRequest: {
+          previous_response_id: "resp_1",
+          useWebSocket: true,
+        },
       });
       ws.close();
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it("forwards previous_response_not_found errors over websocket", async () => {
+    handleProxyRequestMock.mockImplementationOnce(async () => new Response(JSON.stringify({
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        code: "previous_response_not_found",
+        message: "Previous response not found.",
+        param: "previous_response_id",
+      },
+    }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    }));
+
+    const bridge = await startBridge();
+    try {
+      const ws = new WebSocket(`${bridge.url}/openai/v1/responses`, {
+        headers: { Authorization: "Bearer proxy-secret" },
+      });
+      await waitForOpen(ws);
+      ws.send(JSON.stringify({
+        type: "response.create",
+        model: "gpt-5.3-codex",
+        previous_response_id: "resp_missing",
+        input: [],
+      }));
+      const message = await waitForMessage(ws);
+      expect(message).toMatchObject({
+        type: "error",
+        error: {
+          code: "previous_response_not_found",
+          param: "previous_response_id",
+        },
+      });
+      ws.close();
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it("returns an error for response.create without model", async () => {
+    const bridge = await startBridge();
+    try {
+      const ws = new WebSocket(`${bridge.url}/openai/v1/responses`, {
+        headers: { Authorization: "Bearer proxy-secret" },
+      });
+      await waitForOpen(ws);
+      ws.send(JSON.stringify({ type: "response.create", input: "hello" }));
+      const message = await waitForMessage(ws);
+      expect(message).toMatchObject({
+        type: "error",
+        error: { code: "invalid_request" },
+      });
+      expect(handleProxyRequestMock).not.toHaveBeenCalled();
+      ws.close();
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it("sends websocket_connection_limit_reached when the client connection exceeds its lifetime", async () => {
+    const bridge = await startBridge(mockPool(), { maxConnectionMs: 10 });
+    try {
+      const ws = new WebSocket(`${bridge.url}/openai/v1/responses`, {
+        headers: { Authorization: "Bearer proxy-secret" },
+      });
+      await waitForOpen(ws);
+      const message = await waitForMessage(ws);
+      expect(message).toMatchObject({
+        type: "error",
+        error: { code: "websocket_connection_limit_reached" },
+      });
+      await waitForClose(ws);
     } finally {
       await bridge.close();
     }
