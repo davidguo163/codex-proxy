@@ -134,13 +134,18 @@ function parseBase64urlJson<T>(value: string): T | null {
   }
 }
 
-function signingSecret(): string {
+function configuredProxyApiKey(): string {
   let configKey = "";
   try {
     configKey = getConfig().server.proxy_api_key ?? "";
   } catch {
     configKey = "";
   }
+  return configKey;
+}
+
+function signingSecret(): string {
+  const configKey = configuredProxyApiKey();
   const secret = process.env.CODEX_INTERNAL_TOKEN_SECRET || configKey;
   if (!secret) {
     throw new Error("Internal token signing secret is not configured");
@@ -148,8 +153,24 @@ function signingSecret(): string {
   return secret;
 }
 
+function verificationSecrets(): string[] {
+  const secrets = [
+    signingSecret(),
+    ...((process.env.CODEX_INTERNAL_TOKEN_SECRET_PREVIOUS ?? "")
+      .split(",")
+      .map((secret) => secret.trim())
+      .filter(Boolean)),
+    configuredProxyApiKey(),
+  ];
+  return [...new Set(secrets.filter(Boolean))];
+}
+
+function signWithSecret(parts: string, secret: string): string {
+  return createHmac("sha256", secret).update(parts).digest("base64url");
+}
+
 function sign(parts: string): string {
-  return createHmac("sha256", signingSecret()).update(parts).digest("base64url");
+  return signWithSecret(parts, signingSecret());
 }
 
 function compactJwt(payload: unknown): string {
@@ -168,7 +189,8 @@ function verifySignedToken<T>(token: string, prefix: string): T | null {
   const parts = raw.split(".");
   if (parts.length !== 3) return null;
   const [header, body, signature] = parts;
-  if (sign(`${header}.${body}`) !== signature) return null;
+  const signedPart = `${header}.${body}`;
+  if (!verificationSecrets().some((secret) => signWithSecret(signedPart, secret) === signature)) return null;
   return parseBase64urlJson<T>(body);
 }
 
