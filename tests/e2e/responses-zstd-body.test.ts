@@ -16,9 +16,14 @@ import { AccountPool } from "@src/auth/account-pool.js";
 import { CookieJar } from "@src/proxy/cookie-jar.js";
 import { ProxyPool } from "@src/proxy/proxy-pool.js";
 import { loadStaticModels } from "@src/models/model-store.js";
-import { zstdCompressSync } from "node:zlib";
+import {
+  brotliCompressSync,
+  deflateSync,
+  gzipSync,
+  zstdCompressSync,
+} from "node:zlib";
 
-describe("E2E: responses zstd request body", () => {
+describe("E2E: responses encoded request bodies", () => {
   let accountPool: AccountPool;
   let cookieJar: CookieJar;
   let proxyPool: ProxyPool;
@@ -53,20 +58,25 @@ describe("E2E: responses zstd request body", () => {
     accountPool.destroy();
   });
 
-  it("decodes Content-Encoding zstd before parsing JSON", async () => {
+  it.each([
+    ["gzip", (body: Buffer) => gzipSync(body)],
+    ["deflate", (body: Buffer) => deflateSync(body)],
+    ["br", (body: Buffer) => brotliCompressSync(body)],
+    ["zstd", (body: Buffer) => zstdCompressSync(body)],
+  ] as const)("decodes Content-Encoding %s before parsing JSON", async (encoding, encode) => {
     const body = {
       instructions: "You are helpful",
       input: [{ role: "user", content: "Hello" }],
       model: "codex",
       stream: true,
     };
-    const compressed = zstdCompressSync(Buffer.from(JSON.stringify(body), "utf8"));
+    const compressed = encode(Buffer.from(JSON.stringify(body), "utf8"));
 
     const res = await app.request("/v1/responses", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Content-Encoding": "zstd",
+        "Content-Encoding": encoding,
       },
       body: compressed,
     });

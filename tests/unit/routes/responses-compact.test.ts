@@ -7,7 +7,12 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { gzipSync } from "node:zlib";
+import {
+  brotliCompressSync,
+  deflateSync,
+  gzipSync,
+  zstdCompressSync,
+} from "node:zlib";
 import { Hono, type Context } from "hono";
 import type { HandleDirectRequestOptions } from "@src/routes/shared/proxy-handler-types.js";
 
@@ -307,23 +312,56 @@ describe("POST /v1/responses/compact", () => {
     expect(body.error.code).toBe("invalid_json");
   });
 
-  it("decodes gzip compact request bodies before parsing JSON", async () => {
+  it.each([
+    ["gzip", (body: Buffer) => gzipSync(body)],
+    ["deflate", (body: Buffer) => deflateSync(body)],
+    ["br", (body: Buffer) => brotliCompressSync(body)],
+    ["zstd", (body: Buffer) => zstdCompressSync(body)],
+    ["identity", (body: Buffer) => body],
+  ] as const)("decodes %s compact request bodies before parsing JSON", async (encoding, encode) => {
     const body = {
       model: "codex",
       input: [{ role: "user", content: "Hello" }],
       instructions: "",
     };
+    const encodedBody = encode(Buffer.from(JSON.stringify(body), "utf8"));
     const res = await app.request("/v1/responses/compact", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Content-Encoding": "gzip",
+        "Content-Encoding": encoding,
       },
-      body: gzipSync(Buffer.from(JSON.stringify(body), "utf8")),
+      body: encodedBody,
     });
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ output: [{ role: "user", content: "compacted" }] });
+    expect(capturedCompactRequest).toMatchObject({
+      input: [{ role: "user", content: "Hello" }],
+    });
+  });
+
+  it("decodes stacked compact request content encodings in reverse order", async () => {
+    const body = {
+      model: "codex",
+      input: [{ role: "user", content: "stacked" }],
+      instructions: "",
+    };
+    const encodedBody = gzipSync(brotliCompressSync(Buffer.from(JSON.stringify(body), "utf8")));
+
+    const res = await app.request("/v1/responses/compact", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Encoding": "br, gzip",
+      },
+      body: encodedBody,
+    });
+
+    expect(res.status).toBe(200);
+    expect(capturedCompactRequest).toMatchObject({
+      input: [{ role: "user", content: "stacked" }],
+    });
   });
 
   it("returns error when upstream fails", async () => {

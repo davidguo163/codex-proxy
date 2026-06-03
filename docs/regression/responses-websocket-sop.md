@@ -21,6 +21,8 @@ Run from `/data2/minicodex1/codex-proxy`:
 
 ```bash
 npm test -- tests/unit/routes/responses-ws.test.ts
+npm test -- tests/unit/routes/responses-compact.test.ts
+npm test -- tests/e2e/responses-zstd-body.test.ts
 npm test -- tests/unit/proxy/ws-pool.test.ts
 npm test -- tests/unit/proxy/ws-transport.test.ts
 npm test -- tests/integration/ws-pool-reuse.test.ts
@@ -30,6 +32,8 @@ npm run build
 Pass criteria:
 
 - `responses-ws.test.ts` passes all tests.
+- `responses-compact.test.ts` covers `gzip`, `deflate`, `br`, `zstd`, `identity`, and stacked `Content-Encoding`.
+- `responses-zstd-body.test.ts` covers encoded `/v1/responses` request bodies for `gzip`, `deflate`, `br`, and `zstd`.
 - `ws-pool`, `ws-transport`, and `ws-pool-reuse` pass.
 - `npm run build` exits `0`.
 
@@ -41,6 +45,8 @@ After syncing code to `/usr/local/codex-proxy`, run on the remote server:
 sudo ssh -p 27615 deploy@esv-bi01 \
   'cd /usr/local/codex-proxy &&
    npm test -- tests/unit/routes/responses-ws.test.ts &&
+   npm test -- tests/unit/routes/responses-compact.test.ts &&
+   npm test -- tests/e2e/responses-zstd-body.test.ts &&
    npm run build &&
    sudo systemctl restart codex-proxy.service &&
    systemctl is-active codex-proxy.service'
@@ -49,6 +55,7 @@ sudo ssh -p 27615 deploy@esv-bi01 \
 Pass criteria:
 
 - Remote `responses-ws.test.ts` passes.
+- Remote encoded-body tests pass for compact and streaming Responses paths.
 - Remote build exits `0`.
 - `systemctl is-active codex-proxy.service` prints `active`.
 
@@ -189,7 +196,34 @@ sudo ssh -p 27615 deploy@esv-bi01 \
    tail -120'
 ```
 
-## 8. Notes for AI Reruns
+## 8. Encoded Body Regression
+
+Do not rely on the Codex client for this check: `czkf` does not provide a stable way to force specific request-body encodings. Use server-side simulated requests instead.
+
+Run locally:
+
+```bash
+npm test -- tests/unit/routes/responses-compact.test.ts
+npm test -- tests/e2e/responses-zstd-body.test.ts
+```
+
+Run remotely after deployment:
+
+```bash
+sudo ssh -p 27615 deploy@esv-bi01 \
+  'cd /usr/local/codex-proxy &&
+   npm test -- tests/unit/routes/responses-compact.test.ts &&
+   npm test -- tests/e2e/responses-zstd-body.test.ts'
+```
+
+Pass criteria:
+
+- Compact endpoint accepts `gzip`, `deflate`, `br`, `zstd`, and `identity` request bodies.
+- Compact endpoint decodes stacked encodings in reverse order, for example `Content-Encoding: br, gzip`.
+- Streaming `/v1/responses` accepts `gzip`, `deflate`, `br`, and `zstd` request bodies.
+- Decoded requests preserve the original `input` sent to the upstream handler.
+
+## 9. Notes for AI Reruns
 
 - Do not modify `~/.codex-zkf/config.toml` just to run forced-WSS checks. Use `-c` overrides.
 - The built-in `openai` provider cannot be overridden with `model_providers.openai.supports_websockets=true`; use `model_provider="easyceo_codex_proxy"` for forced-WSS checks.
