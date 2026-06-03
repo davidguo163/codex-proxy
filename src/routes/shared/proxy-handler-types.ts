@@ -29,6 +29,8 @@ export interface ProxyRequest {
    *  Used to attribute success/failure to the image_generation request counters
    *  even when the upstream call fails before the first SSE event arrives. */
   expectsImageGen?: boolean;
+  /** If true, explicit previous_response_id requests must stay on the account that created that response. */
+  requirePreviousResponseAccount?: boolean;
 }
 
 export interface UsageHint {

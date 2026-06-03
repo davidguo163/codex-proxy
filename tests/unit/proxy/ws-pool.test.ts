@@ -57,7 +57,15 @@ class MockWs extends EventEmitter implements WsLike {
   }
 }
 
-function newPersistentWs(opts: { hooks?: Partial<PersistentWsHooks>; entryId?: string; poolKey?: string; pingIntervalMs?: number; livenessTimeoutMs?: number } = {}) {
+function newPersistentWs(opts: {
+  hooks?: Partial<PersistentWsHooks>;
+  entryId?: string;
+  poolKey?: string;
+  pingIntervalMs?: number;
+  livenessTimeoutMs?: number;
+  firstEventTimeoutMs?: number;
+  streamIdleTimeoutMs?: number;
+} = {}) {
   const ws = new MockWs();
   const onDead = vi.fn();
   const persistent = new PersistentWs({
@@ -67,6 +75,8 @@ function newPersistentWs(opts: { hooks?: Partial<PersistentWsHooks>; entryId?: s
     hooks: { onDead, ...opts.hooks },
     pingIntervalMs: opts.pingIntervalMs,
     livenessTimeoutMs: opts.livenessTimeoutMs,
+    firstEventTimeoutMs: opts.firstEventTimeoutMs,
+    streamIdleTimeoutMs: opts.streamIdleTimeoutMs,
   });
   return { ws, persistent, onDead };
 }
@@ -115,6 +125,52 @@ describe("PersistentWs", () => {
     ws.pushClose(1006, "tcp rst");
     await expect(promise).rejects.toBeInstanceOf(Error);
     await expect(promise).rejects.not.toBeInstanceOf(WsReusedConnectionError);
+  });
+
+
+  it("rejects and evicts when upstream never sends the first non-internal frame", async () => {
+    vi.useFakeTimers();
+    try {
+      const { persistent, onDead } = newPersistentWs({ firstEventTimeoutMs: 25 });
+      persistent.tryAcquire();
+      const promise = persistent.send({
+        request: { type: "response.create", model: "m", instructions: "", input: [] },
+        signal: undefined,
+        onRateLimits: undefined,
+        reused: false,
+      });
+      promise.catch(() => { /* test-controlled rejection */ });
+      await nextTick();
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(promise).rejects.toThrow("first event timeout");
+      expect(persistent.isAlive()).toBe(false);
+      expect(onDead).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("errors and evicts an active stream when upstream stops before a terminal event", async () => {
+    vi.useFakeTimers();
+    try {
+      const { ws, persistent, onDead } = newPersistentWs({ firstEventTimeoutMs: 0, streamIdleTimeoutMs: 25 });
+      persistent.tryAcquire();
+      const promise = persistent.send({
+        request: { type: "response.create", model: "m", instructions: "", input: [] },
+        signal: undefined,
+        onRateLimits: undefined,
+        reused: false,
+      });
+      await nextTick();
+      ws.pushMessage({ type: "response.created", response: { id: "resp_idle" } });
+      const resp = await promise;
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(resp.text()).rejects.toThrow("stream idle timeout");
+      expect(persistent.isAlive()).toBe(false);
+      expect(onDead).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("send resolves Response on first non-internal frame and streams subsequent events", async () => {

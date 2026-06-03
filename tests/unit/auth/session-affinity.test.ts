@@ -169,6 +169,13 @@ describe("SessionAffinityMap", () => {
     expect(map.lookupFunctionCallIds("resp_missing")).toEqual([]);
   });
 
+  it("looks up stored variant hash for a response", () => {
+    map = new SessionAffinityMap();
+    map.record("resp_1", "entry_1", "conv_same", undefined, undefined, undefined, undefined, "vh_main");
+    expect(map.lookupVariantHash("resp_1")).toBe("vh_main");
+    expect(map.lookupVariantHash("resp_missing")).toBeNull();
+  });
+
   it("looks up stored instructions for a response", () => {
     map = new SessionAffinityMap();
     map.record("resp_1", "entry_1", "conv_same", undefined, "system prompt");

@@ -107,6 +107,80 @@ describe("buildProxyRetryRecoveryDecision", () => {
 
     expect(decision).toEqual({ action: "none" });
   });
+
+
+  it("does not strip previous_response_id for websocket delta continuations", () => {
+    const err = codexError(400, {
+      type: "invalid_request_error",
+      code: "previous_response_not_found",
+      message: "Previous response with id 'resp_stale' not found.",
+    });
+    const request = proxyRequest();
+    request.requirePreviousResponseAccount = true;
+    request.codexRequest.input = [{ role: "user", content: "continue" }];
+
+    const decision = buildProxyRetryRecoveryDecision({
+      err,
+      tag: "openai",
+      entryId: "e1",
+      stripAndRetryDone: false,
+      previousResponseId: "resp_stale",
+      request,
+    });
+
+    expect(decision).toEqual({ action: "none" });
+  });
+
+  it("does not strip previous_response_id for bare function_call_output continuations", () => {
+    const err = codexError(400, {
+      type: "invalid_request_error",
+      code: "previous_response_not_found",
+      message: "Previous response with id 'resp_stale' not found.",
+    });
+    const request = proxyRequest();
+    request.codexRequest.input = [
+      { type: "function_call_output", call_id: "call_123", output: "done" },
+    ];
+
+    const decision = buildProxyRetryRecoveryDecision({
+      err,
+      tag: "openai",
+      entryId: "e1",
+      stripAndRetryDone: false,
+      previousResponseId: "resp_stale",
+      request,
+    });
+
+    expect(decision).toEqual({ action: "none" });
+  });
+
+  it("can strip previous_response_id for self-contained tool replays", () => {
+    const err = codexError(400, {
+      type: "invalid_request_error",
+      code: "previous_response_not_found",
+      message: "Previous response with id 'resp_stale' not found.",
+    });
+    const request = proxyRequest();
+    request.codexRequest.input = [
+      { type: "function_call", call_id: "call_123", name: "lookup", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_123", output: "done" },
+    ];
+
+    const decision = buildProxyRetryRecoveryDecision({
+      err,
+      tag: "openai",
+      entryId: "e1",
+      stripAndRetryDone: false,
+      previousResponseId: "resp_stale",
+      request,
+    });
+
+    expect(decision).toMatchObject({
+      action: "retry",
+      kind: "previous_response_not_found",
+      staleId: "resp_stale",
+    });
+  });
 });
 
 describe("applyProxyRetryRecoveryDecision", () => {

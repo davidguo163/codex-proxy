@@ -80,6 +80,21 @@ export async function handleProxyRequest(options: HandleProxyRequestOptions): Pr
   }
 
   let { entryId } = acquired;
+  if (
+    req.requirePreviousResponseAccount &&
+    sessionContext.preferredEntryId &&
+    entryId !== sessionContext.preferredEntryId
+  ) {
+    accountPool.releaseWithoutCounting(entryId);
+    return respondWithProxyError({
+      c,
+      req,
+      fmt,
+      status: 409,
+      message: "Pinned previous_response_id account is no longer available.",
+    });
+  }
+
   let codexApi = buildCodexApi(acquired.token, acquired.accountId, cookieJar, entryId, proxyPool);
   const triedEntryIds: string[] = [entryId];
   let modelRetried = false;
@@ -243,6 +258,7 @@ export async function handleProxyRequest(options: HandleProxyRequestOptions): Pr
         entryId,
         stripAndRetryDone,
         previousResponseId: req.codexRequest.previous_response_id,
+        request: req,
       });
       if (retryRecovery.action === "retry") {
         stripAndRetryDone = true;
@@ -258,6 +274,21 @@ export async function handleProxyRequest(options: HandleProxyRequestOptions): Pr
       const decision = handleCodexApiError(
         err, accountPool, entryId, req.codexRequest.model, fmt.tag, modelRetried, cookieJar,
       );
+      if (
+        req.requirePreviousResponseAccount &&
+        req.codexRequest.previous_response_id &&
+        decision.action === "retry"
+      ) {
+        releaseAccount(accountPool, entryId, annotateImageGenOutcome(undefined, req.expectsImageGen), released);
+        return respondWithProxyError({
+          c,
+          req,
+          fmt,
+          status: decision.status,
+          message: decision.message,
+          ...(decision.useFormat429 ? { useFormat429: true } : {}),
+        });
+      }
 
       const errorRetryTransition = applyProxyErrorRetryTransition({
         accountPool,

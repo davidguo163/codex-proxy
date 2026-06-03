@@ -131,6 +131,7 @@ function createMockAccountPool(overrides: Record<string, unknown> = {}) {
   return {
     acquire: vi.fn(() => ({ entryId: "e1", token: "tok", accountId: "acc1" })),
     release: vi.fn(),
+    releaseWithoutCounting: vi.fn(),
     markRateLimited: vi.fn(),
     applyRateLimit429: vi.fn(),
     updateCachedQuota: vi.fn(),
@@ -218,6 +219,57 @@ describe("proxy-handler integration", () => {
     expect(body).toEqual({ error: "no_account" });
     expect(fmt.formatNoAccount).toHaveBeenCalled();
     expect(accountPool.release).not.toHaveBeenCalled();
+  });
+
+  it("fails WSS previous_response_id continuations when the pinned account cannot be acquired", async () => {
+    const affinityMap = getSessionAffinityMap();
+    affinityMap.record("resp_prev", "e1", "conv_prev", undefined, "You are helpful", undefined, undefined, "vh-prev");
+    const accountPool = createMockAccountPool({
+      acquire: vi.fn(() => ({ entryId: "e2", token: "tok2", accountId: "acc2" })),
+    });
+    const req: ProxyRequest = {
+      ...createDefaultRequest(),
+      codexRequest: {
+        ...createDefaultRequest().codexRequest,
+        previous_response_id: "resp_prev",
+      },
+      requirePreviousResponseAccount: true,
+    };
+    const { app } = buildTestApp({ accountPool, req });
+
+    const res = await app.request("/test", { method: "POST" });
+
+    expect(res.status).toBe(409);
+    expect(accountPool.releaseWithoutCounting).toHaveBeenCalledWith("e2");
+    expect(accountPool.release).not.toHaveBeenCalled();
+  });
+
+  it("does not fallback to another account for WSS previous_response_id retryable upstream errors", async () => {
+    const affinityMap = getSessionAffinityMap();
+    affinityMap.record("resp_prev", "e1", "conv_prev", undefined, "You are helpful", undefined, undefined, "vh-prev");
+    const accountPool = createMockAccountPool({
+      acquire: vi.fn(() => ({ entryId: "e1", token: "tok", accountId: "acc1" })),
+      hasAvailableAccounts: vi.fn(() => true),
+    });
+    const req: ProxyRequest = {
+      ...createDefaultRequest(),
+      codexRequest: {
+        ...createDefaultRequest().codexRequest,
+        previous_response_id: "resp_prev",
+      },
+      requirePreviousResponseAccount: true,
+    };
+    mockCreateResponse = () => Promise.reject(new CodexApiError(429, JSON.stringify({
+      error: { type: "usage_limit_reached", resets_in_seconds: 60, message: "limit" },
+    })));
+    const { app } = buildTestApp({ accountPool, req });
+
+    const res = await app.request("/test", { method: "POST" });
+
+    expect(res.status).toBe(429);
+    expect(accountPool.acquire).toHaveBeenCalledTimes(1);
+    expect(accountPool.hasAvailableAccounts).not.toHaveBeenCalled();
+    expect(accountPool.release).toHaveBeenCalledWith("e1", undefined);
   });
 
   // 2. Non-streaming success

@@ -23,6 +23,8 @@ import { parseRateLimitsEvent } from "./rate-limit-headers.js";
 import { CodexApiError } from "./codex-types.js";
 import { getProxyUrl } from "../tls/proxy.js";
 import {
+  DEFAULT_FIRST_EVENT_TIMEOUT_MS,
+  DEFAULT_STREAM_IDLE_TIMEOUT_MS,
   PersistentWs,
   WsReusedConnectionError,
   type PersistentWsHooks,
@@ -314,6 +316,8 @@ async function openOneShotWs(
     // route them through the existing CodexApiError → rotation path.
     let earlyDecisionMade = false;
     let sawTerminalEvent = false;
+    let firstEventTimer: ReturnType<typeof setTimeout> | null = null;
+    let streamIdleTimer: ReturnType<typeof setTimeout> | null = null;
 
     function closeStream() {
       if (!streamClosed && controller) {
@@ -329,8 +333,39 @@ async function openOneShotWs(
       }
     }
 
+    function clearFirstEventTimer() {
+      if (firstEventTimer) {
+        clearTimeout(firstEventTimer);
+        firstEventTimer = null;
+      }
+    }
+
+    function clearStreamIdleTimer() {
+      if (streamIdleTimer) {
+        clearTimeout(streamIdleTimer);
+        streamIdleTimer = null;
+      }
+    }
+
+    function clearTimers() {
+      clearFirstEventTimer();
+      clearStreamIdleTimer();
+    }
+
+    function armStreamIdleTimeout() {
+      if (DEFAULT_STREAM_IDLE_TIMEOUT_MS <= 0 || sawTerminalEvent || streamClosed) return;
+      clearStreamIdleTimer();
+      streamIdleTimer = setTimeout(() => {
+        if (sawTerminalEvent || streamClosed) return;
+        errorStream(new Error(`WebSocket upstream stream idle timeout after ${DEFAULT_STREAM_IDLE_TIMEOUT_MS}ms`));
+        try { ws.close(1000, "stream idle timeout"); } catch { /* already closing */ }
+      }, DEFAULT_STREAM_IDLE_TIMEOUT_MS);
+      streamIdleTimer.unref?.();
+    }
+
     // Abort signal handling
     const onAbort = () => {
+      clearTimers();
       try { ws.close(1000, "aborted"); } catch { /* already closing */ }
       if (!earlyDecisionMade) {
         earlyDecisionMade = true;
@@ -344,6 +379,7 @@ async function openOneShotWs(
         controller = c;
       },
       cancel() {
+        clearTimers();
         ws.close(1000, "stream cancelled");
       },
     });
@@ -365,6 +401,13 @@ async function openOneShotWs(
 
     ws.on("open", () => {
       ws.send(JSON.stringify(request));
+      firstEventTimer = setTimeout(() => {
+        if (earlyDecisionMade || streamClosed) return;
+        earlyDecisionMade = true;
+        reject(new Error(`WebSocket upstream first event timeout after ${DEFAULT_FIRST_EVENT_TIMEOUT_MS}ms`));
+        try { ws.close(1000, "first event timeout"); } catch { /* already closing */ }
+      }, DEFAULT_FIRST_EVENT_TIMEOUT_MS);
+      firstEventTimer.unref?.();
       // resolve() is deferred until the first non-internal frame arrives in
       // ws.on("message"). This lets us classify early upstream errors (e.g.
       // usage_limit_reached) and reject with a CodexApiError so the
@@ -398,6 +441,7 @@ async function openOneShotWs(
 
       if (!earlyDecisionMade) {
         earlyDecisionMade = true;
+        clearFirstEventTimer();
         if (msg) {
           const classified = classifyWsErrorEvent(msg);
           if (classified) {
@@ -418,19 +462,24 @@ async function openOneShotWs(
         // Close stream after response.completed, response.failed, or error
         if (isTerminalWsEvent(type)) {
           sawTerminalEvent = true;
+          clearTimers();
           queueMicrotask(() => {
             closeStream();
             ws.close(1000);
           });
+        } else {
+          armStreamIdleTimeout();
         }
       } else {
         // Non-JSON message — emit as raw data
         const sse = `data: ${raw}\n\n`;
         controller!.enqueue(encoder.encode(sse));
+        armStreamIdleTimeout();
       }
     });
 
     ws.on("error", (err: Error) => {
+      clearTimers();
       signal?.removeEventListener("abort", onAbort);
       if (!earlyDecisionMade) {
         earlyDecisionMade = true;
@@ -441,6 +490,7 @@ async function openOneShotWs(
     });
 
     ws.on("close", (code: number, reason: Buffer) => {
+      clearTimers();
       signal?.removeEventListener("abort", onAbort);
       if (!earlyDecisionMade) {
         earlyDecisionMade = true;

@@ -73,6 +73,8 @@ interface InFlightSession {
   onRateLimits: ((rl: ParsedRateLimit) => void) | undefined;
   earlyDecisionMade: boolean;
   sawTerminalEvent: boolean;
+  firstEventTimer: ReturnType<typeof setTimeout> | null;
+  streamIdleTimer: ReturnType<typeof setTimeout> | null;
   /** Resolves the outer send() Promise with the SSE Response.
    *  Closes over the freshly-built ReadableStream so callers don't need to
    *  pass it back in. */
@@ -163,6 +165,17 @@ export const DEFAULT_PING_INTERVAL_MS = 25_000;
  *  and re-using it would cost a real-request cache miss. */
 export const DEFAULT_LIVENESS_TIMEOUT_MULTIPLIER = 2.5;
 
+/** Max time to wait for the first upstream event after sending response.create.
+ *  Without this, a wedged upstream/proxy WS can leave Codex clients waiting
+ *  until their much longer transport timeout (~5 minutes). */
+export const DEFAULT_FIRST_EVENT_TIMEOUT_MS = 45_000;
+
+/** Max idle gap between upstream events once a response stream has started.
+ *  This is deliberately longer than the first-event timeout so slow reasoning
+ *  turns still have room, while still failing much faster than silent 5 minute
+ *  hangs when the upstream stops producing terminal events. */
+export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 180_000;
+
 export class PersistentWs {
   readonly id: string;
   readonly entryId: string;
@@ -184,6 +197,8 @@ export class PersistentWs {
    *  would otherwise eat a fresh-WS cache miss on the next real request. */
   private lastActivityAt: number;
   private readonly livenessTimeoutMs: number;
+  private readonly firstEventTimeoutMs: number;
+  private readonly streamIdleTimeoutMs: number;
 
   constructor(opts: {
     ws: WsLike;
@@ -197,6 +212,10 @@ export class PersistentWs {
      *  0 disables the liveness check entirely. Omit to default to
      *  {@link DEFAULT_LIVENESS_TIMEOUT_MULTIPLIER} × pingIntervalMs. */
     livenessTimeoutMs?: number;
+    /** 0 disables the first upstream event timeout. */
+    firstEventTimeoutMs?: number;
+    /** 0 disables the active stream idle timeout. */
+    streamIdleTimeoutMs?: number;
   }) {
     this.id = randomUUID().slice(0, 8);
     this.ws = opts.ws;
@@ -226,6 +245,8 @@ export class PersistentWs {
 
     const pingMs = opts.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS;
     this.livenessTimeoutMs = opts.livenessTimeoutMs ?? Math.round(pingMs * DEFAULT_LIVENESS_TIMEOUT_MULTIPLIER);
+    this.firstEventTimeoutMs = opts.firstEventTimeoutMs ?? DEFAULT_FIRST_EVENT_TIMEOUT_MS;
+    this.streamIdleTimeoutMs = opts.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS;
     if (pingMs > 0) {
       this.pingTimer = setInterval(() => this.sendKeepalivePing(), pingMs);
       this.pingTimer.unref?.();
@@ -309,6 +330,8 @@ export class PersistentWs {
             onRateLimits: opts.onRateLimits,
             earlyDecisionMade: false,
             sawTerminalEvent: false,
+            firstEventTimer: null,
+            streamIdleTimer: null,
             resolveResponse: () => resolve(this.buildResponse(stream)),
             reject: wrappedReject,
             abortListener: null,
@@ -321,6 +344,7 @@ export class PersistentWs {
             opts.signal.addEventListener("abort", listener, { once: true });
             this.currentSession.abortListener = listener;
           }
+          this.armFirstEventTimeout();
         },
         cancel: () => {
           // Caller stopped reading the stream mid-flight. Server may still
@@ -358,6 +382,7 @@ export class PersistentWs {
       this.pingTimer = undefined;
     }
     try { this.ws.close(1000, reason.slice(0, 120)); } catch { /* already closing */ }
+    this.clearSessionTimers();
     if (this.currentSession && !this.currentSession.streamClosed) {
       try { this.currentSession.controller.close(); } catch { /* already closed */ }
       this.currentSession.streamClosed = true;
@@ -366,6 +391,45 @@ export class PersistentWs {
     this.busy = false;
     this.currentSession = null;
     try { this.hooks.onDead(); } catch { /* hook errors must not propagate */ }
+  }
+
+  private clearSessionTimers(sess: InFlightSession | null = this.currentSession): void {
+    if (!sess) return;
+    if (sess.firstEventTimer) {
+      clearTimeout(sess.firstEventTimer);
+      sess.firstEventTimer = null;
+    }
+    if (sess.streamIdleTimer) {
+      clearTimeout(sess.streamIdleTimer);
+      sess.streamIdleTimer = null;
+    }
+  }
+
+  private armFirstEventTimeout(): void {
+    const sess = this.currentSession;
+    if (!sess || this.firstEventTimeoutMs <= 0) return;
+    sess.firstEventTimer = setTimeout(() => {
+      const active = this.currentSession;
+      if (!active || active.earlyDecisionMade || active.streamClosed) return;
+      active.earlyDecisionMade = true;
+      active.reject(new Error(`WebSocket upstream first event timeout after ${this.firstEventTimeoutMs}ms`));
+      this.markDead("first event timeout");
+    }, this.firstEventTimeoutMs);
+    sess.firstEventTimer.unref?.();
+  }
+
+  private armStreamIdleTimeout(): void {
+    const sess = this.currentSession;
+    if (!sess || this.streamIdleTimeoutMs <= 0 || sess.sawTerminalEvent || sess.streamClosed) return;
+    if (sess.streamIdleTimer) clearTimeout(sess.streamIdleTimer);
+    sess.streamIdleTimer = setTimeout(() => {
+      const active = this.currentSession;
+      if (!active || active.sawTerminalEvent || active.streamClosed) return;
+      try { active.controller.error(new Error(`WebSocket upstream stream idle timeout after ${this.streamIdleTimeoutMs}ms`)); } catch { /* already closed */ }
+      active.streamClosed = true;
+      this.markDead("stream idle timeout");
+    }, this.streamIdleTimeoutMs);
+    sess.streamIdleTimer.unref?.();
   }
 
   private detachAbortListener(): void {
@@ -409,6 +473,10 @@ export class PersistentWs {
 
     if (!sess.earlyDecisionMade) {
       sess.earlyDecisionMade = true;
+      if (sess.firstEventTimer) {
+        clearTimeout(sess.firstEventTimer);
+        sess.firstEventTimer = null;
+      }
       if (msg) {
         const classified = classifyWsErrorEvent(msg);
         if (classified) {
@@ -433,10 +501,14 @@ export class PersistentWs {
 
       if (isTerminalWsEvent(type)) {
         sess.sawTerminalEvent = true;
+        this.clearSessionTimers(sess);
         queueMicrotask(() => this.releaseAfterTerminalFrame());
+      } else {
+        this.armStreamIdleTimeout();
       }
     } else {
       sess.controller.enqueue(this.encoder.encode(`data: ${raw}\n\n`));
+      this.armStreamIdleTimeout();
     }
   }
 
@@ -506,6 +578,7 @@ export class PersistentWs {
       try { sess.controller.close(); } catch { /* already closed */ }
       sess.streamClosed = true;
     }
+    this.clearSessionTimers(sess);
     this.detachAbortListener();
     this.currentSession = null;
     this.busy = false;
@@ -517,6 +590,8 @@ export class PersistentWs {
    *  treat early errors as account-level and keep the WS open only if the
    *  error wasn't connection-fatal. */
   private releaseAfterEarlyError(): void {
+    const sess = this.currentSession;
+    this.clearSessionTimers(sess);
     this.detachAbortListener();
     this.currentSession = null;
     this.busy = false;

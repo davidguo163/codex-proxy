@@ -1,26 +1,12 @@
 import type { IncomingMessage } from "http";
 import type { Duplex } from "stream";
-import { randomUUID } from "crypto";
 import WebSocket, { WebSocketServer } from "ws";
 import type { AccountPool } from "../auth/account-pool.js";
 import type { CookieJar } from "../proxy/cookie-jar.js";
 import type { ProxyPool } from "../proxy/proxy-pool.js";
-import { acquireAccount, releaseAccount } from "./shared/account-acquisition.js";
-import { buildCodexApi } from "./shared/proxy-handler-utils.js";
-import { parseModelName, buildDisplayModelName, isRecognizedModelName } from "../models/model-store.js";
 import type { UpstreamRouter } from "../proxy/upstream-router.js";
-import { sanitizeClientMetadata } from "../proxy/openai-subagent.js";
-import { recordProxyEgressLog } from "./shared/proxy-egress-log.js";
-import { summarizeRequestForLog } from "../logs/request-summary.js";
-import { enqueueLogEntry } from "../logs/entry.js";
 import { getConfig } from "../config.js";
-import type { CodexResponsesRequest } from "../proxy/codex-types.js";
-import { applyParsedRateLimits } from "./shared/proxy-rate-limit.js";
-import { extractImageGenUsage, extractResponseUsage } from "./responses.js";
-import { logProxyUsage } from "./shared/proxy-usage-log.js";
-import { buildWsPoolContext } from "./shared/proxy-ws-context.js";
-import { computeVariantHash } from "./shared/variant-hash.js";
-import type { UsageInfo } from "../translation/codex-event-extractor.js";
+import { createResponsesRoutes } from "./responses.js";
 
 interface BridgeDeps {
   accountPool: AccountPool;
@@ -72,139 +58,111 @@ function isUpgradeAuthorized(req: IncomingMessage, accountPool: AccountPool): bo
   return !!token && accountPool.validateProxyApiKey(token);
 }
 
-function toCodexRequest(payload: Record<string, unknown>): CodexResponsesRequest {
-  const clientMetadata = sanitizeClientMetadata(
-    (payload.client_metadata && typeof payload.client_metadata === "object" ? payload.client_metadata : {}) as Record<string, unknown>,
-  );
-  return {
-    model: buildDisplayModelName(parseModelName(String(payload.model))),
-    instructions: typeof payload.instructions === "string" ? payload.instructions : undefined,
-    input: Array.isArray(payload.input) ? (payload.input as any[]) : [],
-    stream: true,
-    store: false,
-    reasoning: typeof payload.reasoning === "object" && payload.reasoning ? (payload.reasoning as any) : undefined,
-    service_tier: typeof payload.service_tier === "string" ? payload.service_tier : undefined,
-    tools: Array.isArray(payload.tools) ? payload.tools : undefined,
-    tool_choice: typeof payload.tool_choice === "string" || (payload.tool_choice && typeof payload.tool_choice === "object") ? payload.tool_choice as any : undefined,
-    parallel_tool_calls: typeof payload.parallel_tool_calls === "boolean" ? payload.parallel_tool_calls : undefined,
-    text: payload.text && typeof payload.text === "object" ? payload.text as any : undefined,
-    previous_response_id: typeof payload.previous_response_id === "string" ? payload.previous_response_id : undefined,
-    prompt_cache_key: typeof payload.prompt_cache_key === "string"
-      ? payload.prompt_cache_key
-      : typeof clientMetadata["x-client-request-id"] === "string" ? clientMetadata["x-client-request-id"] : undefined,
-    client_metadata: clientMetadata,
-    include: Array.isArray(payload.include) ? payload.include.filter((x): x is string => typeof x === "string") : undefined,
-    useWebSocket: true,
-    turnMetadata: typeof clientMetadata["x-codex-turn-metadata"] === "string" ? clientMetadata["x-codex-turn-metadata"] : undefined,
-    betaFeatures: typeof clientMetadata["x-codex-beta-features"] === "string" ? clientMetadata["x-codex-beta-features"] : undefined,
-    includeTimingMetrics: typeof clientMetadata["x-responsesapi-include-timing-metrics"] === "string" ? clientMetadata["x-responsesapi-include-timing-metrics"] : undefined,
-    parentThreadId: typeof clientMetadata["x-codex-parent-thread-id"] === "string" ? clientMetadata["x-codex-parent-thread-id"] : undefined,
-    codexWindowId: typeof clientMetadata["x-codex-window-id"] === "string" ? clientMetadata["x-codex-window-id"] : undefined,
-  };
+function forwardedHeaders(req: IncomingMessage): Headers {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (value == null) continue;
+    if (key.toLowerCase() === "upgrade" || key.toLowerCase() === "connection") continue;
+    headers.set(key, Array.isArray(value) ? value.join(",") : String(value));
+  }
+  headers.set("content-type", "application/json");
+  headers.set("x-codex-proxy-ws-bridge", "true");
+  return headers;
 }
 
-interface ResponsesWsSessionState {
-  conversationId: string;
-  entryId?: string;
+async function forwardJsonResponse(ws: WebSocket, response: Response): Promise<void> {
+  const text = await response.text();
+  if (!text) return;
+  try {
+    sendJson(ws, JSON.parse(text));
+  } catch {
+    sendJson(ws, buildError(text, "upstream_error", response.status >= 500 ? "server_error" : "invalid_request_error"));
+  }
+}
+
+function parseSseBlock(block: string): unknown | null {
+  const dataLines: string[] = [];
+  let eventType: string | undefined;
+  for (const rawLine of block.split(/\r?\n/)) {
+    const line = rawLine.trimEnd();
+    if (line.startsWith("event:")) {
+      eventType = line.slice("event:".length).trim();
+    } else if (line.startsWith("data:")) {
+      dataLines.push(line.slice("data:".length).trimStart());
+    }
+  }
+  if (dataLines.length === 0) return null;
+  const data = dataLines.join("\n");
+  try {
+    return JSON.parse(data);
+  } catch {
+    return { type: eventType || "event", data };
+  }
+}
+
+async function forwardSseResponse(ws: WebSocket, response: Response): Promise<void> {
+  if (!response.body) {
+    await forwardJsonResponse(ws, response);
+    return;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      for (;;) {
+        const match = buffer.match(/\r?\n\r?\n/);
+        if (!match || match.index == null) break;
+        const block = buffer.slice(0, match.index);
+        buffer = buffer.slice(match.index + match[0].length);
+        const parsed = parseSseBlock(block);
+        if (parsed != null) sendJson(ws, parsed);
+      }
+    }
+    buffer += decoder.decode();
+    const tail = buffer.trim();
+    if (tail) {
+      const parsed = parseSseBlock(tail);
+      if (parsed != null) sendJson(ws, parsed);
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 async function bridgeSingleRequest(
   ws: WebSocket,
   payload: Record<string, unknown>,
   req: IncomingMessage,
-  deps: BridgeDeps,
-  session: ResponsesWsSessionState,
+  app: ReturnType<typeof createResponsesRoutes>,
 ) {
   const model = typeof payload.model === "string" ? payload.model : null;
   if (!model) {
     sendJson(ws, buildError("Missing model", "invalid_request"));
     return;
   }
-  const routeMatch = deps.upstreamRouter?.resolveMatch(model) ?? (isRecognizedModelName(model)
-    ? { kind: "codex" as const }
-    : { kind: "not-found" as const });
-  if (routeMatch.kind !== "codex") {
-    sendJson(ws, buildError("WebSocket bridge only supports codex-routed models", "unsupported_model_route"));
-    return;
-  }
-
-  const codexRequest = toCodexRequest(payload);
-  const acquired = acquireAccount(deps.accountPool, codexRequest.model, undefined, "ResponsesWS", session.entryId);
-  if (!acquired) {
-    sendJson(ws, buildError("No available accounts. All accounts are expired or rate-limited.", "no_available_accounts", "server_error"));
-    return;
-  }
-  if (session.entryId && acquired.entryId !== session.entryId) {
-    deps.accountPool.releaseWithoutCounting(acquired.entryId);
-    sendJson(ws, buildError("Pinned websocket session account is no longer available.", "session_account_unavailable", "server_error"));
-    return;
-  }
-  session.entryId = acquired.entryId;
-
-  const released = new Set<string>();
-  let usageInfo: UsageInfo | undefined;
-  const requestId = firstHeaderValue(req.headers["x-client-request-id"]) || randomUUID().slice(0, 8);
-  const conversationId = codexRequest.prompt_cache_key ?? session.conversationId;
-  enqueueLogEntry({
-    requestId,
-    direction: "ingress",
-    method: "WS",
-    path: req.url || "/openai/v1/responses",
-    model,
-    stream: true,
-    request: summarizeRequestForLog("responses_ws", payload, {
-      ip: req.socket.remoteAddress || null,
-      headers: Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v.join(",") : String(v ?? "")])),
-    }),
-  });
 
   const abortController = new AbortController();
-  const abortUpstream = () => abortController.abort();
-  ws.once("close", abortUpstream);
-  ws.once("error", abortUpstream);
+  const abortRequest = () => abortController.abort();
+  ws.once("close", abortRequest);
+  ws.once("error", abortRequest);
 
   try {
-    const api = buildCodexApi(acquired.token, acquired.accountId, deps.cookieJar, acquired.entryId, deps.proxyPool);
-    const startMs = Date.now();
-    const response = await api.createResponse(
-      codexRequest,
-      abortController.signal,
-      (rateLimits) => applyParsedRateLimits({ accountPool: deps.accountPool, entryId: acquired.entryId, rateLimits }),
-      buildWsPoolContext({
-        useWebSocket: codexRequest.useWebSocket,
-        conversationId,
-        entryId: acquired.entryId,
-        variantHash: computeVariantHash(codexRequest.instructions, codexRequest.tools, codexRequest.model),
-        requestId,
-        tag: "ResponsesWS",
-      }),
-    );
-    recordProxyEgressLog({
-      requestId,
-      request: { codexRequest, model: codexRequest.model, isStreaming: true },
-      status: response.status,
-      startMs,
+    const request = new Request("http://127.0.0.1/v1/responses", {
+      method: "POST",
+      headers: forwardedHeaders(req),
+      body: JSON.stringify(payload),
+      signal: abortController.signal,
     });
-
-    for await (const evt of api.parseStream(response)) {
-      const body = evt.data;
-      if (evt.event === "response.completed" && isRecord(body) && isRecord(body.response)) {
-        const responseBody = body.response;
-        if (isRecord(responseBody.usage)) {
-          usageInfo = {
-            ...extractResponseUsage(responseBody.usage),
-            ...(extractImageGenUsage(responseBody) ?? {}),
-          };
-        }
-      }
-      if (body && typeof body === "object") {
-        sendJson(ws, body);
-      } else {
-        sendJson(ws, { type: evt.event || "event", data: body });
-      }
-    }
-    if (usageInfo) {
-      logProxyUsage({ tag: "ResponsesWS", entryId: acquired.entryId, requestId, usage: usageInfo });
+    const response = await app.fetch(request);
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("text/event-stream")) {
+      await forwardSseResponse(ws, response);
+    } else {
+      await forwardJsonResponse(ws, response);
     }
   } catch (err) {
     if (!abortController.signal.aborted) {
@@ -212,17 +170,14 @@ async function bridgeSingleRequest(
       sendJson(ws, buildError(message, "upstream_error", "server_error"));
     }
   } finally {
-    ws.off("close", abortUpstream);
-    ws.off("error", abortUpstream);
-    releaseAccount(deps.accountPool, acquired.entryId, usageInfo, released);
+    ws.off("close", abortRequest);
+    ws.off("error", abortRequest);
   }
 }
 
 function attachWsBridge(wss: WebSocketServer, deps: BridgeDeps): void {
+  const responsesApp = createResponsesRoutes(deps.accountPool, deps.cookieJar, deps.proxyPool, deps.upstreamRouter);
   wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
-    const session: ResponsesWsSessionState = {
-      conversationId: firstHeaderValue(req.headers["x-client-request-id"]) || randomUUID().slice(0, 8),
-    };
     let queue = Promise.resolve();
 
     ws.on("message", (raw) => {
@@ -239,7 +194,11 @@ function attachWsBridge(wss: WebSocketServer, deps: BridgeDeps): void {
           sendJson(ws, buildError("Only response.create is supported", "unsupported_type"));
           return;
         }
-        await bridgeSingleRequest(ws, payload, req, deps, session);
+        if (!isRecord(payload)) {
+          sendJson(ws, buildError("Request body must be a JSON object", "invalid_request"));
+          return;
+        }
+        await bridgeSingleRequest(ws, payload, req, responsesApp);
       }).catch((err) => {
         const message = err instanceof Error ? err.message : String(err);
         sendJson(ws, buildError(message, "bridge_queue_error", "server_error"));

@@ -915,6 +915,7 @@ export function createResponsesRoutes(
       isStreaming: clientWantsStream,
       tupleSchema,
       expectsImageGen,
+      requirePreviousResponseAccount: c.req.header("x-codex-proxy-ws-bridge") === "true" && typeof body.previous_response_id === "string",
     };
 
     const requestId = c.get("requestId") ?? randomUUID().slice(0, 8);

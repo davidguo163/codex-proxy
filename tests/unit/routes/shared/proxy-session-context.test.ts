@@ -80,8 +80,36 @@ describe("buildProxySessionContext", () => {
     expect(context.prevRespId).toBe("resp_prev");
     expect(context.preferredEntryId).toBe("entry-prev");
     expect(context.explicitTurnState).toBe("turn-prev");
+    expect(context.variantHash).toBe("variant-prev");
     expect(context.continuationInputStart).toBe(0);
     expect(context.resumeEvaluationInput.implicitPrevRespId).toBeNull();
+  });
+
+  it("keeps explicit previous-response continuations on the stored variant", () => {
+    const affinityMap = makeAffinityMap();
+    affinityMap.record(
+      "resp_prev",
+      "entry-prev",
+      "conversation-prev",
+      "turn-prev",
+      "system",
+      33,
+      ["call_prev"],
+      "variant-prev",
+    );
+    const request = makeProxyRequest({
+      codexRequest: makeCodexRequest({
+        previous_response_id: "resp_prev",
+        prompt_cache_key: "explicit-cache",
+        input: [{ type: "function_call_output", call_id: "call_prev", output: "done" }],
+      }),
+    });
+
+    const context = buildProxySessionContext({ request, affinityMap });
+
+    expect(context.chainConversationId).toBe("conversation-prev");
+    expect(context.variantHash).toBe("variant-prev");
+    expect(context.preferredEntryId).toBe("entry-prev");
   });
 
   it("ignores blank prompt cache and client conversation ids", () => {
