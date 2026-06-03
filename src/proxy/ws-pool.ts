@@ -179,6 +179,11 @@ export const DEFAULT_FIRST_EVENT_TIMEOUT_MS = 45_000;
  *  hangs when the upstream stops producing terminal events. */
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 180_000;
 
+/** Max time to wait for a WebSocket TCP/TLS/upgrade handshake to complete.
+ *  The first-event timeout only starts after `open`, so this covers stalls
+ *  before the connection is usable. */
+export const DEFAULT_CONNECT_TIMEOUT_MS = DEFAULT_FIRST_EVENT_TIMEOUT_MS;
+
 export class PersistentWs {
   readonly id: string;
   readonly entryId: string;

@@ -6,6 +6,7 @@ import { EventEmitter } from "node:events";
 
 const wsInstances = vi.hoisted(() => [] as EventEmitter[]);
 const globalProxyUrl = vi.hoisted(() => ({ value: null as string | null }));
+const mockWsBehavior = vi.hoisted(() => ({ autoOpen: true }));
 
 vi.mock("ws", () => {
   const { EventEmitter: EE } = require("node:events") as typeof import("node:events");
@@ -21,6 +22,7 @@ vi.mock("ws", () => {
       this.url = url;
       this.opts = opts;
       wsInstances.push(this);
+      if (!mockWsBehavior.autoOpen) return;
       queueMicrotask(() => {
         this.readyState = 1;
         this.emit("open");
@@ -58,6 +60,7 @@ vi.mock("@src/tls/proxy.js", () => ({
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 import { createWebSocketResponse, type WsCreateRequest } from "@src/proxy/ws-transport.js";
+import { WsConnectionPool } from "@src/proxy/ws-pool.js";
 
 interface MockWs extends EventEmitter {
   url: string;
@@ -144,6 +147,8 @@ describe("createWebSocketResponse", () => {
   beforeEach(() => {
     wsInstances.length = 0;
     globalProxyUrl.value = null;
+    mockWsBehavior.autoOpen = true;
+    vi.useRealTimers();
   });
 
   it("connects and sends the request message", async () => {
@@ -254,6 +259,45 @@ describe("createWebSocketResponse", () => {
     await expect(
       createWebSocketResponse("wss://test/ws", {}, BASE_REQUEST, controller.signal),
     ).rejects.toThrow("Aborted");
+  });
+
+  it("rejects when the one-shot WebSocket never opens", async () => {
+    vi.useFakeTimers();
+    mockWsBehavior.autoOpen = false;
+
+    const promise = createWebSocketResponse("wss://test/ws", {}, BASE_REQUEST);
+    promise.catch(() => { /* test-controlled rejection */ });
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    await expect(promise).rejects.toThrow("connect timeout");
+    expect(lastWs().readyState).toBe(3);
+  });
+
+  it("times out pooled persistent connect and then times out fallback one-shot connect", async () => {
+    vi.useFakeTimers();
+    mockWsBehavior.autoOpen = false;
+    const pool = new WsConnectionPool({}, { startGc: false });
+    const promise = createWebSocketResponse(
+      "wss://test/ws",
+      {},
+      BASE_REQUEST,
+      undefined,
+      undefined,
+      undefined,
+      {
+        pool,
+        poolKey: "entry-1:conv-1:vh",
+        entryId: "entry-1",
+      },
+    );
+    promise.catch(() => { /* test-controlled rejection */ });
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(wsInstances).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(45_000);
+    await expect(promise).rejects.toThrow("connect timeout");
+    expect(pool.size()).toBe(0);
+    await pool.shutdown();
   });
 
   it("passes previous_response_id without store/stream fields", async () => {
