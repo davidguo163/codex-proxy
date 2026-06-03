@@ -558,6 +558,58 @@ describe("proxy-handler integration", () => {
     });
   });
 
+  it("falls back to another account for non-pinned WSS 429 errors", async () => {
+    const body429 = JSON.stringify({
+      error: { type: "usage_limit_reached", message: "Limit reached", resets_in_seconds: 321 },
+    });
+    const seenRequests: CodexResponsesRequest[] = [];
+    let createCount = 0;
+    mockCreateResponse = (request) => {
+      seenRequests.push({ ...request });
+      createCount++;
+      if (createCount === 1) return Promise.reject(new CodexApiError(429, body429));
+      return Promise.resolve(new Response("data: {}\n\n"));
+    };
+
+    let acquireCount = 0;
+    const accountPool = createMockAccountPool({
+      acquire: vi.fn(() => {
+        acquireCount++;
+        if (acquireCount === 1) return { entryId: "e1", token: "tok1", accountId: "acc1" };
+        return { entryId: "e2", token: "tok2", accountId: "acc2" };
+      }),
+    });
+    const fmt = createMockFormatAdapter();
+    const req: ProxyRequest = {
+      ...createStreamingRequest(),
+      codexRequest: {
+        ...createStreamingRequest().codexRequest,
+        useWebSocket: true,
+      },
+    };
+    const { app } = buildTestApp({ accountPool, fmt, req });
+
+    const res = await app.request("/test", { method: "POST" });
+
+    expect(res.status).toBe(200);
+    await expect(res.text()).resolves.toContain("data: [DONE]");
+    expect(accountPool.acquire).toHaveBeenCalledTimes(2);
+    expect(accountPool.applyRateLimit429).toHaveBeenCalledWith("e1", {
+      retryAfterSec: 321,
+      countRequest: true,
+    });
+    expect(accountPool.release).toHaveBeenCalledTimes(1);
+    expect(accountPool.release).toHaveBeenCalledWith("e2", {
+      input_tokens: 10,
+      output_tokens: 20,
+    });
+    expect(seenRequests).toHaveLength(2);
+    for (const seenRequest of seenRequests) {
+      expect(seenRequest.useWebSocket).toBe(true);
+      expect(seenRequest).not.toHaveProperty("previous_response_id");
+    }
+  });
+
   // 4b. 429 with no resets_in_seconds → retryAfterSec undefined
   it("handles 429 with plain body (no resets_in_seconds) using default backoff", async () => {
     mockCreateResponse = () =>

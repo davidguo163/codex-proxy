@@ -35,6 +35,7 @@ Pass criteria:
 - `responses-compact.test.ts` covers `gzip`, `deflate`, `br`, `zstd`, `identity`, and stacked `Content-Encoding`.
 - `responses-zstd-body.test.ts` covers encoded `/v1/responses` request bodies for `gzip`, `deflate`, `br`, and `zstd`.
 - `ws-pool`, `ws-transport`, and `ws-pool-reuse` pass.
+- `proxy-handler.test.ts` covers non-pinned WSS 429 account fallback and pinned `previous_response_id` no-fallback behavior.
 - `npm run build` exits `0`.
 
 ## 2. Remote Deploy Regression
@@ -223,7 +224,30 @@ Pass criteria:
 - Streaming `/v1/responses` accepts `gzip`, `deflate`, `br`, and `zstd` request bodies.
 - Decoded requests preserve the original `input` sent to the upstream handler.
 
-## 9. Notes for AI Reruns
+## 9. WSS 429 Account Fallback Regression
+
+Do not use live OpenAI rate limits to test account fallback. Simulate the upstream WebSocket 429 so the result is deterministic.
+
+Run:
+
+```bash
+npm test -- tests/unit/proxy/ws-transport-early-error.test.ts
+npm test -- tests/unit/proxy/codex-api-headers.test.ts
+npm test -- tests/integration/proxy-handler.test.ts
+```
+
+Pass criteria:
+
+- `ws-transport-early-error.test.ts` proves an early WS `usage_limit_reached` frame becomes `CodexApiError(429)`.
+- `codex-api-headers.test.ts` proves WS `CodexApiError(429)` is not downgraded to HTTP fallback.
+- `proxy-handler.test.ts` proves a non-pinned WSS request with 429:
+  - calls `applyRateLimit429("e1", ...)`;
+  - acquires fallback account `e2`;
+  - succeeds on `e2`;
+  - keeps `useWebSocket: true` on both attempts.
+- `proxy-handler.test.ts` also proves pinned `previous_response_id` WSS 429 does not switch accounts, because switching would lose upstream conversation history.
+
+## 10. Notes for AI Reruns
 
 - Do not modify `~/.codex-zkf/config.toml` just to run forced-WSS checks. Use `-c` overrides.
 - The built-in `openai` provider cannot be overridden with `model_providers.openai.supports_websockets=true`; use `model_provider="easyceo_codex_proxy"` for forced-WSS checks.
