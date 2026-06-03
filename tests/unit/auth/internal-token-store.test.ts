@@ -18,6 +18,7 @@ const headers = new Headers({
 describe("InternalTokenStore", () => {
   beforeEach(() => {
     process.env.CODEX_INTERNAL_TOKEN_SECRET = "test-secret";
+    delete process.env.CODEX_INTERNAL_TOKEN_SECRET_PREVIOUS;
   });
 
   it("issues an internal token after start, approve, and poll", () => {
@@ -107,6 +108,30 @@ describe("InternalTokenStore", () => {
     expect(pollResult.ok).toBe(true);
     if (!pollResult.ok) return;
 
+    const restartedStore = new InternalTokenStore();
+    const refreshResult = restartedStore.refresh(
+      pollResult.payload.refresh_token,
+      headers,
+      "127.0.0.1:18080",
+    );
+
+    expect(refreshResult.ok).toBe(true);
+    if (!refreshResult.ok) return;
+    expect(refreshResult.payload.access_token).toMatch(/^itg_access_/);
+    expect(restartedStore.validateAccessToken(refreshResult.payload.access_token)).toBe(true);
+  });
+
+  it("accepts refresh tokens signed by a previous internal token secret", () => {
+    process.env.CODEX_INTERNAL_TOKEN_SECRET = "old-secret";
+    const firstStore = new InternalTokenStore();
+    const start = firstStore.start(headers, "127.0.0.1:18080");
+    expect(firstStore.approve(start.userCode)).toEqual({ ok: true });
+    const pollResult = firstStore.poll(start.deviceCode, headers, "127.0.0.1:18080");
+    expect(pollResult.ok).toBe(true);
+    if (!pollResult.ok) return;
+
+    process.env.CODEX_INTERNAL_TOKEN_SECRET = "new-secret";
+    process.env.CODEX_INTERNAL_TOKEN_SECRET_PREVIOUS = "old-secret";
     const restartedStore = new InternalTokenStore();
     const refreshResult = restartedStore.refresh(
       pollResult.payload.refresh_token,
