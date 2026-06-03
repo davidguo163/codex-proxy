@@ -53,7 +53,10 @@ export function buildProxySessionContext(
   const effectiveConversationId = promptCacheIdentity.conversationId;
   const chainConversationId = explicitConversationId ?? effectiveConversationId;
   const variantIdentity = buildVariantIdentity(codexRequest, promptCacheIdentity);
-  const variantHash = computeVariantHash(codexRequest.instructions, codexRequest.tools, variantIdentity);
+  const computedVariantHash = computeVariantHash(codexRequest.instructions, codexRequest.tools, variantIdentity);
+  const variantHash = explicitPrevRespId
+    ? affinityMap.lookupVariantHash(explicitPrevRespId) ?? computedVariantHash
+    : computedVariantHash;
   const implicitPrevRespId =
     !explicitPrevRespId &&
     continuationInputStart > 0 &&

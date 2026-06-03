@@ -5,6 +5,7 @@ import {
 import type { SessionAffinityMap } from "../../auth/session-affinity.js";
 import type { ProxyRequest } from "./proxy-handler-types.js";
 import { stripCodexErrorPrefix } from "./proxy-handler-utils.js";
+import { isSelfContainedReplay, getFunctionCallOutputIds } from "./proxy-session-helpers.js";
 
 export type ProxyRetryRecoveryKind =
   | "previous_response_not_found"
@@ -25,6 +26,7 @@ export interface BuildProxyRetryRecoveryDecisionOptions {
   entryId: string;
   stripAndRetryDone: boolean;
   previousResponseId: string | undefined;
+  request?: ProxyRequest;
 }
 
 export interface ApplyProxyRetryRecoveryDecisionOptions {
@@ -39,14 +41,28 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+function canStripPreviousResponseId(request: ProxyRequest | undefined): boolean {
+  if (!request) return true;
+  if (request.requirePreviousResponseAccount) {
+    return isSelfContainedReplay(request.codexRequest.input);
+  }
+  const outputIds = getFunctionCallOutputIds(request.codexRequest.input);
+  return outputIds.length === 0 || isSelfContainedReplay(request.codexRequest.input);
+}
+
 export function buildProxyRetryRecoveryDecision({
   err,
   tag,
   entryId,
   stripAndRetryDone,
   previousResponseId,
+  request,
 }: BuildProxyRetryRecoveryDecisionOptions): ProxyRetryRecoveryDecision {
   if (stripAndRetryDone) {
+    return { action: "none" };
+  }
+
+  if (!canStripPreviousResponseId(request)) {
     return { action: "none" };
   }
 

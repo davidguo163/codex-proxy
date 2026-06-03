@@ -126,6 +126,11 @@ export class SessionAffinityMap {
     return entry?.functionCallIds ? [...entry.functionCallIds] : [];
   }
 
+  lookupVariantHash(responseId: string): string | null {
+    const entry = this.getEntry(responseId);
+    return entry?.variantHash ?? null;
+  }
+
   /** Drop a response ID — called after upstream rejects it as not-found. */
   forget(responseId: string): void {
     this.map.delete(responseId);
