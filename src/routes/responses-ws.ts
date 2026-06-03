@@ -5,7 +5,6 @@ import type { AccountPool } from "../auth/account-pool.js";
 import type { CookieJar } from "../proxy/cookie-jar.js";
 import type { ProxyPool } from "../proxy/proxy-pool.js";
 import type { UpstreamRouter } from "../proxy/upstream-router.js";
-import { getConfig } from "../config.js";
 import { createResponsesRoutes } from "./responses.js";
 
 interface BridgeDeps {
@@ -31,16 +30,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-function firstHeaderValue(header: string | string[] | undefined): string | undefined {
-  return Array.isArray(header) ? header[0] : header;
-}
-
-function bearerToken(header: string | string[] | undefined): string | null {
-  const value = firstHeaderValue(header);
-  const prefix = "Bearer ";
-  return value?.startsWith(prefix) ? value.slice(prefix.length) : null;
-}
-
 function rejectUpgrade(socket: Duplex, status: number, message: string): void {
   socket.write(
     `HTTP/1.1 ${status} ${message}\r\n` +
@@ -49,13 +38,6 @@ function rejectUpgrade(socket: Duplex, status: number, message: string): void {
     "\r\n",
   );
   socket.destroy();
-}
-
-function isUpgradeAuthorized(req: IncomingMessage, accountPool: AccountPool): boolean {
-  const config = getConfig();
-  if (!config.server.proxy_api_key) return true;
-  const token = bearerToken(req.headers.authorization);
-  return !!token && accountPool.validateProxyApiKey(token);
 }
 
 function forwardedHeaders(req: IncomingMessage): Headers {
@@ -215,10 +197,6 @@ export function installResponsesWsBridge(server: import("http").Server, deps: Br
     const url = new URL(req.url || "/", `http://${host}`);
     if (url.pathname !== "/openai/v1/responses") {
       rejectUpgrade(socket, 404, "Not Found");
-      return;
-    }
-    if (!isUpgradeAuthorized(req, deps.accountPool)) {
-      rejectUpgrade(socket, 401, "Unauthorized");
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
