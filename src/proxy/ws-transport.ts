@@ -471,9 +471,12 @@ async function openOneShotWs(
         const rl = parseRateLimitsEvent(msg);
         if (rl) onRateLimits(rl);
         const rewritten = getPoolAccounts ? rewriteRateLimitsEventForPool(msg, getPoolAccounts()) : null;
-        if (!rewritten) return;
-        msg = rewritten;
-        type = typeof msg.type === "string" ? msg.type : type;
+        if (rewritten && controller && !streamClosed) {
+          const rewrittenType = typeof rewritten.type === "string" ? rewritten.type : type;
+          const payload = JSON.stringify(rewritten);
+          controller.enqueue(encoder.encode(`event: ${rewrittenType}\ndata: ${payload}\n\n`));
+        }
+        return;
       }
 
       if (!earlyDecisionMade) {

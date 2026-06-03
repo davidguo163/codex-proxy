@@ -479,9 +479,12 @@ export class PersistentWs {
       const rl = parseRateLimitsEvent(msg);
       if (rl) sess.onRateLimits(rl);
       const rewritten = sess.getPoolAccounts ? rewriteRateLimitsEventForPool(msg, sess.getPoolAccounts()) : null;
-      if (!rewritten) return;
-      msg = rewritten;
-      type = typeof msg.type === "string" ? msg.type : type;
+      if (rewritten) {
+        const rewrittenType = typeof rewritten.type === "string" ? rewritten.type : type;
+        const payload = JSON.stringify(rewritten);
+        sess.controller.enqueue(this.encoder.encode(`event: ${rewrittenType}\ndata: ${payload}\n\n`));
+      }
+      return;
     }
 
     if (!sess.earlyDecisionMade) {
