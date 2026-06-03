@@ -18,6 +18,7 @@ import { recordStreamCloseEvent } from "../logs/stream-close-event.js";
 import { summarizeRequestForLog } from "../logs/request-summary.js";
 import { getRealClientIp } from "../utils/get-real-client-ip.js";
 import { randomUUID } from "crypto";
+import { zstdDecompressSync } from "node:zlib";
 import type { UpstreamAdapter } from "../proxy/upstream-adapter.js";
 import { getConfig } from "../config.js";
 import { prepareSchema } from "../translation/shared-utils.js";
@@ -566,6 +567,37 @@ function parseBody(c: Context, body: unknown): Record<string, unknown> | Respons
   return body;
 }
 
+function invalidJsonResponse(c: Context): Response {
+  c.status(400);
+  return c.json({
+    type: "error",
+    error: {
+      type: "invalid_request_error",
+      code: "invalid_json",
+      message: "Malformed JSON request body",
+    },
+  });
+}
+
+async function readJsonRequestBody(c: Context): Promise<unknown> {
+  const contentEncoding = c.req.header("content-encoding")?.toLowerCase() ?? "";
+  if (!contentEncoding.split(",").map((part) => part.trim()).includes("zstd")) {
+    return c.req.json();
+  }
+
+  const requestId = c.get("requestId") ?? "unknown";
+  const encoded = Buffer.from(await c.req.arrayBuffer());
+  try {
+    const decoded = zstdDecompressSync(encoded);
+    return JSON.parse(decoded.toString("utf8"));
+  } catch (err) {
+    console.warn(
+      `[Responses] invalid zstd JSON body rid=${requestId} path=${c.req.path} content_length=${c.req.header("content-length") ?? "unknown"} encoded_bytes=${encoded.length}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    throw err;
+  }
+}
+
 function formatResponsesError(status: number, msg: string): unknown {
   return {
     type: "error",
@@ -760,17 +792,9 @@ export function createResponsesRoutes(
   const responsesHandler = async (c: Context) => {
     let rawBody: unknown;
     try {
-      rawBody = await c.req.json();
+      rawBody = await readJsonRequestBody(c);
     } catch {
-      c.status(400);
-      return c.json({
-        type: "error",
-        error: {
-          type: "invalid_request_error",
-          code: "invalid_json",
-          message: "Malformed JSON request body",
-        },
-      });
+      return invalidJsonResponse(c);
     }
 
     const body = parseBody(c, rawBody);
@@ -946,17 +970,9 @@ export function createResponsesRoutes(
   const compactHandler = async (c: Context) => {
     let rawBody: unknown;
     try {
-      rawBody = await c.req.json();
+      rawBody = await readJsonRequestBody(c);
     } catch {
-      c.status(400);
-      return c.json({
-        type: "error",
-        error: {
-          type: "invalid_request_error",
-          code: "invalid_json",
-          message: "Malformed JSON request body",
-        },
-      });
+      return invalidJsonResponse(c);
     }
 
     const body = parseBody(c, rawBody);
