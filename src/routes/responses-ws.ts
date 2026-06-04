@@ -6,7 +6,7 @@ import type { CookieJar } from "../proxy/cookie-jar.js";
 import type { ProxyPool } from "../proxy/proxy-pool.js";
 import type { UpstreamRouter } from "../proxy/upstream-router.js";
 import { getConfig } from "../config.js";
-import { internalTokenStore } from "../auth/internal-token-store.js";
+import { diagnoseInternalAccessToken, internalTokenStore } from "../auth/internal-token-store.js";
 import { createResponsesRoutes } from "./responses.js";
 
 interface BridgeDeps {
@@ -46,17 +46,51 @@ function rejectUpgrade(socket: Duplex, status: number, message: string): void {
   socket.destroy();
 }
 
-function isValidClientBearerToken(accountPool: AccountPool, token: string): boolean {
+function authScheme(authHeader: string | undefined): string {
+  if (!authHeader) return "missing";
+  const firstSpace = authHeader.indexOf(" ");
+  return firstSpace === -1 ? "none" : authHeader.slice(0, firstSpace);
+}
+
+function diagnoseClientBearerToken(accountPool: AccountPool, token: string | undefined) {
+  if (!token) return { valid: false, proxyKeyValid: false, internalValid: false };
+  let proxyKeyValid = false;
+  let proxyKeyError: string | undefined;
   try {
-    if (accountPool.validateProxyApiKey(token)) return true;
-  } catch {
-    // Fall through to internal-token validation.
+    proxyKeyValid = accountPool.validateProxyApiKey(token);
+  } catch (error) {
+    proxyKeyError = error instanceof Error ? error.message : String(error);
   }
+  let internalValid = false;
+  let internalError: string | undefined;
   try {
-    return internalTokenStore.validateAccessToken(token);
-  } catch {
-    return false;
+    internalValid = internalTokenStore.validateAccessToken(token);
+  } catch (error) {
+    internalError = error instanceof Error ? error.message : String(error);
   }
+  return {
+    valid: proxyKeyValid || internalValid,
+    proxyKeyValid,
+    proxyKeyError,
+    internalValid,
+    internalError,
+    internal: diagnoseInternalAccessToken(token),
+  };
+}
+
+function logRejectedUpgradeAuth(req: IncomingMessage, accountPool: AccountPool, authHeader: string | undefined, providedKey: string | undefined): void {
+  const diagnostics = diagnoseClientBearerToken(accountPool, providedKey);
+  console.warn(
+    `[Auth] Reject websocket token path=${req.url ?? "unknown"} auth_present=${!!authHeader} ` +
+      `auth_scheme=${authScheme(authHeader)} bearer_prefix=${authHeader?.startsWith("Bearer ") ?? false} ` +
+      `provided=${!!providedKey} proxy_key_valid=${diagnostics.proxyKeyValid} ` +
+      `internal_valid=${diagnostics.internalValid} token_hash=${diagnostics.internal?.tokenHash ?? "none"} ` +
+      `token_len=${diagnostics.internal?.tokenLength ?? 0} token_prefix=${diagnostics.internal?.prefix ?? "none"} ` +
+      `jwt_shape=${diagnostics.internal?.jwtShape ?? "none"} signature_valid=${diagnostics.internal?.signatureValid ?? false} ` +
+      `typ=${diagnostics.internal?.typ ?? "none"} exp_delta_s=${diagnostics.internal?.expDeltaSeconds ?? "none"} ` +
+      `iat_age_s=${diagnostics.internal?.iatAgeSeconds ?? "none"} expired=${diagnostics.internal?.expired ?? "none"} ` +
+      `proxy_key_error=${diagnostics.proxyKeyError ?? "none"} internal_error=${diagnostics.internalError ?? "none"}`,
+  );
 }
 
 function isAuthorizedUpgrade(req: IncomingMessage, accountPool: AccountPool): boolean {
@@ -66,7 +100,10 @@ function isAuthorizedUpgrade(req: IncomingMessage, accountPool: AccountPool): bo
     ? req.headers.authorization[0]
     : req.headers.authorization;
   const providedKey = authHeader?.replace("Bearer ", "");
-  return !!providedKey && isValidClientBearerToken(accountPool, providedKey);
+  const diagnostics = diagnoseClientBearerToken(accountPool, providedKey);
+  if (!!providedKey && diagnostics.valid) return true;
+  logRejectedUpgradeAuth(req, accountPool, authHeader, providedKey);
+  return false;
 }
 
 function forwardedHeaders(req: IncomingMessage): Headers {
