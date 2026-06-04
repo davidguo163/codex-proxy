@@ -100,6 +100,20 @@ export interface InternalApprovalIdentity {
   accountId?: string | null;
 }
 
+export interface InternalAccessTokenDiagnostics {
+  tokenHash: string;
+  tokenLength: number;
+  prefix: "itg_access" | "itg_refresh" | "other";
+  jwtShape: "ok" | "not_prefixed" | "malformed";
+  signatureValid: boolean;
+  typ?: string;
+  exp?: number;
+  iat?: number;
+  expDeltaSeconds?: number;
+  iatAgeSeconds?: number;
+  expired?: boolean;
+}
+
 const DEVICE_TTL_MS = 15 * 60 * 1000;
 const AUTH_CODE_TTL_MS = 5 * 60 * 1000;
 const ACCESS_TTL_MS = 60 * 60 * 1000;
@@ -192,6 +206,49 @@ function verifySignedToken<T>(token: string, prefix: string): T | null {
   const signedPart = `${header}.${body}`;
   if (!verificationSecrets().some((secret) => signWithSecret(signedPart, secret) === signature)) return null;
   return parseBase64urlJson<T>(body);
+}
+
+export function diagnoseInternalAccessToken(token: string): InternalAccessTokenDiagnostics {
+  const trimmed = token.trim();
+  const tokenHash = createHash("sha256").update(trimmed).digest("hex").slice(0, 12);
+  const prefix = trimmed.startsWith("itg_access_")
+    ? "itg_access"
+    : trimmed.startsWith("itg_refresh_")
+      ? "itg_refresh"
+      : "other";
+  const base = {
+    tokenHash,
+    tokenLength: trimmed.length,
+    prefix,
+  } satisfies Pick<InternalAccessTokenDiagnostics, "tokenHash" | "tokenLength" | "prefix">;
+  if (prefix !== "itg_access") {
+    return { ...base, jwtShape: "not_prefixed", signatureValid: false };
+  }
+
+  const raw = trimmed.slice("itg_access_".length);
+  const parts = raw.split(".");
+  if (parts.length !== 3) {
+    return { ...base, jwtShape: "malformed", signatureValid: false };
+  }
+
+  const [header, body, signature] = parts;
+  const signedPart = `${header}.${body}`;
+  const signatureValid = verificationSecrets().some((secret) => signWithSecret(signedPart, secret) === signature);
+  const payload = parseBase64urlJson<Partial<SignedAccessPayload>>(body);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const exp = typeof payload?.exp === "number" ? payload.exp : undefined;
+  const iat = typeof payload?.iat === "number" ? payload.iat : undefined;
+  return {
+    ...base,
+    jwtShape: "ok",
+    signatureValid,
+    typ: typeof payload?.typ === "string" ? payload.typ : undefined,
+    exp,
+    iat,
+    expDeltaSeconds: exp === undefined ? undefined : exp - nowSeconds,
+    iatAgeSeconds: iat === undefined ? undefined : nowSeconds - iat,
+    expired: exp === undefined ? undefined : exp <= nowSeconds,
+  };
 }
 
 function makeCodeChallenge(verifier: string): string {

@@ -45,7 +45,7 @@ import {
   OPENAI_SUBAGENT_HEADER,
   sanitizeClientMetadata,
 } from "../proxy/openai-subagent.js";
-import { internalTokenStore } from "../auth/internal-token-store.js";
+import { diagnoseInternalAccessToken, internalTokenStore } from "../auth/internal-token-store.js";
 
 const X_CODEX_TURN_STATE_HEADER = "x-codex-turn-state";
 const X_CODEX_TURN_METADATA_HEADER = "x-codex-turn-metadata";
@@ -522,17 +522,59 @@ const PASSTHROUGH_FORMAT: FormatAdapter = {
 
 // ── Shared auth check ─────────────────────────────────────────────
 
-function isValidClientBearerToken(accountPool: AccountPool, token: string): boolean {
+function authScheme(authHeader: string | undefined): string {
+  if (!authHeader) return "missing";
+  const firstSpace = authHeader.indexOf(" ");
+  return firstSpace === -1 ? "none" : authHeader.slice(0, firstSpace);
+}
+
+function diagnoseClientBearerToken(accountPool: AccountPool, token: string | undefined) {
+  if (!token) return { valid: false, proxyKeyValid: false, internalValid: false };
+  let proxyKeyValid = false;
+  let proxyKeyError: string | undefined;
   try {
-    if (accountPool.validateProxyApiKey(token)) return true;
-  } catch {
-    // Fall through to internal-token validation.
+    proxyKeyValid = accountPool.validateProxyApiKey(token);
+  } catch (error) {
+    proxyKeyError = error instanceof Error ? error.message : String(error);
   }
+  let internalValid = false;
+  let internalError: string | undefined;
   try {
-    return internalTokenStore.validateAccessToken(token);
-  } catch {
-    return false;
+    internalValid = internalTokenStore.validateAccessToken(token);
+  } catch (error) {
+    internalError = error instanceof Error ? error.message : String(error);
   }
+  return {
+    valid: proxyKeyValid || internalValid,
+    proxyKeyValid,
+    proxyKeyError,
+    internalValid,
+    internalError,
+    internal: diagnoseInternalAccessToken(token),
+  };
+}
+
+function logRejectedAuth(
+  c: Context,
+  accountPool: AccountPool,
+  authHeader: string | undefined,
+  providedKey: string | undefined,
+  allowUnauthenticated: boolean,
+): void {
+  const requestId = c.get("requestId") ?? "unknown";
+  const diagnostics = diagnoseClientBearerToken(accountPool, providedKey);
+  console.warn(
+    `[Auth] Reject client token rid=${requestId} path=${c.req.path} method=${c.req.method} ` +
+      `allowUnauthenticated=${allowUnauthenticated} auth_present=${!!authHeader} ` +
+      `auth_scheme=${authScheme(authHeader)} bearer_prefix=${authHeader?.startsWith("Bearer ") ?? false} ` +
+      `provided=${!!providedKey} proxy_key_valid=${diagnostics.proxyKeyValid} ` +
+      `internal_valid=${diagnostics.internalValid} token_hash=${diagnostics.internal?.tokenHash ?? "none"} ` +
+      `token_len=${diagnostics.internal?.tokenLength ?? 0} token_prefix=${diagnostics.internal?.prefix ?? "none"} ` +
+      `jwt_shape=${diagnostics.internal?.jwtShape ?? "none"} signature_valid=${diagnostics.internal?.signatureValid ?? false} ` +
+      `typ=${diagnostics.internal?.typ ?? "none"} exp_delta_s=${diagnostics.internal?.expDeltaSeconds ?? "none"} ` +
+      `iat_age_s=${diagnostics.internal?.iatAgeSeconds ?? "none"} expired=${diagnostics.internal?.expired ?? "none"} ` +
+      `proxy_key_error=${diagnostics.proxyKeyError ?? "none"} internal_error=${diagnostics.internalError ?? "none"}`,
+  );
 }
 
 function checkAuth(
@@ -556,8 +598,10 @@ function checkAuth(
   if (config.server.proxy_api_key) {
     const authHeader = c.req.header("Authorization");
     const providedKey = authHeader?.replace("Bearer ", "");
-    const validClientToken = !!providedKey && isValidClientBearerToken(accountPool, providedKey);
+    const tokenDiagnostics = diagnoseClientBearerToken(accountPool, providedKey);
+    const validClientToken = !!providedKey && tokenDiagnostics.valid;
     if (!validClientToken) {
+      logRejectedAuth(c, accountPool, authHeader, providedKey, allowUnauthenticated);
       c.status(401);
       return c.json({
         type: "error",
